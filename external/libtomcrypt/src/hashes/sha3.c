@@ -1,0 +1,639 @@
+/* LibTomCrypt, modular cryptographic library -- Tom St Denis */
+/* SPDX-License-Identifier: Unlicense */
+
+/* based on https://github.com/brainhub/SHA3IUF (public domain) */
+
+#include "tomcrypt_private.h"
+
+#ifdef LTC_SHA3
+
+const struct ltc_hash_descriptor sha3_224_desc =
+{
+   "sha3-224",                  /* name of hash */
+   17,                          /* internal ID */
+   28,                          /* Size of digest in octets */
+   144,                         /* Input block size in octets */
+   { 2,16,840,1,101,3,4,2,7 },  /* ASN.1 OID */
+   9,                           /* Length OID */
+   &sha3_224_init,
+   &sha3_process,
+   &sha3_done,
+   &sha3_224_test,
+   NULL
+};
+
+const struct ltc_hash_descriptor sha3_256_desc =
+{
+   "sha3-256",                  /* name of hash */
+   18,                          /* internal ID */
+   32,                          /* Size of digest in octets */
+   136,                         /* Input block size in octets */
+   { 2,16,840,1,101,3,4,2,8 },  /* ASN.1 OID */
+   9,                           /* Length OID */
+   &sha3_256_init,
+   &sha3_process,
+   &sha3_done,
+   &sha3_256_test,
+   NULL
+};
+
+const struct ltc_hash_descriptor sha3_384_desc =
+{
+   "sha3-384",                  /* name of hash */
+   19,                          /* internal ID */
+   48,                          /* Size of digest in octets */
+   104,                         /* Input block size in octets */
+   { 2,16,840,1,101,3,4,2,9 },  /* ASN.1 OID */
+   9,                           /* Length OID */
+   &sha3_384_init,
+   &sha3_process,
+   &sha3_done,
+   &sha3_384_test,
+   NULL
+};
+
+const struct ltc_hash_descriptor sha3_512_desc =
+{
+   "sha3-512",                  /* name of hash */
+   20,                          /* internal ID */
+   64,                          /* Size of digest in octets */
+   72,                          /* Input block size in octets */
+   { 2,16,840,1,101,3,4,2,10 }, /* ASN.1 OID */
+   9,                           /* Length OID */
+   &sha3_512_init,
+   &sha3_process,
+   &sha3_done,
+   &sha3_512_test,
+   NULL
+};
+
+const struct ltc_hash_descriptor shake128_desc =
+{
+   "shake128",                   /* name of hash */
+   34,                           /* internal ID */
+   32,                           /* Size of digest in octets */
+   168,                          /* Input block size in octets */
+   { 2,16,840,1,101,3,4,2,11 },  /* ASN.1 OID */
+   9,                            /* Length OID */
+   &sha3_shake128_init,
+   &sha3_process,
+   &sha3_shake128_done,
+   &sha3_shake128_test,
+   NULL
+};
+
+const struct ltc_hash_descriptor shake256_desc =
+{
+   "shake256",                   /* name of hash */
+   35,                           /* internal ID */
+   64,                           /* Size of digest in octets */
+   136,                          /* Input block size in octets */
+   { 2,16,840,1,101,3,4,2,12 },  /* ASN.1 OID */
+   9,                            /* Length OID */
+   &sha3_shake256_init,
+   &sha3_process,
+   &sha3_shake256_done,
+   &sha3_shake256_test,
+   NULL
+};
+#endif
+
+#ifdef LTC_KECCAK
+const struct ltc_hash_descriptor keccak_224_desc =
+{
+   "keccak224",                 /* name of hash */
+   29,                          /* internal ID */
+   28,                          /* Size of digest in octets */
+   144,                         /* Input block size in octets */
+   { 0 }, 0,                    /* no ASN.1 OID */
+   &sha3_224_init,
+   &sha3_process,
+   &keccak_done,
+   &keccak_224_test,
+   NULL
+};
+
+const struct ltc_hash_descriptor keccak_256_desc =
+{
+   "keccak256",                 /* name of hash */
+   30,                          /* internal ID */
+   32,                          /* Size of digest in octets */
+   136,                         /* Input block size in octets */
+   { 0 }, 0,                    /* no ASN.1 OID */
+   &sha3_256_init,
+   &sha3_process,
+   &keccak_done,
+   &keccak_256_test,
+   NULL
+};
+
+const struct ltc_hash_descriptor keccak_384_desc =
+{
+   "keccak384",                 /* name of hash */
+   31,                          /* internal ID */
+   48,                          /* Size of digest in octets */
+   104,                         /* Input block size in octets */
+   { 0 }, 0,                    /* no ASN.1 OID */
+   &sha3_384_init,
+   &sha3_process,
+   &keccak_done,
+   &keccak_384_test,
+   NULL
+};
+
+const struct ltc_hash_descriptor keccak_512_desc =
+{
+   "keccak512",                 /* name of hash */
+   32,                          /* internal ID */
+   64,                          /* Size of digest in octets */
+   72,                          /* Input block size in octets */
+   { 0 }, 0,                    /* no ASN.1 OID */
+   &sha3_512_init,
+   &sha3_process,
+   &keccak_done,
+   &keccak_512_test,
+   NULL
+};
+#endif
+
+#if defined(LTC_SHA3) || defined(LTC_KECCAK)
+
+#define SHA3_KECCAK_SPONGE_WORDS 25 /* 1600 bits > 200 bytes > 25 x ulong64 */
+#define SHA3_KECCAK_ROUNDS 24
+#define SHA3_KECCAK_RC_OFFSET 0
+#define SHA3_KECCAK_TURBO_ROUNDS 12
+#define SHA3_KECCAK_TURBO_RC_OFFSET 12
+
+static const ulong64 s_keccakf_rndc[24] = {
+   CONST64(0x0000000000000001), CONST64(0x0000000000008082),
+   CONST64(0x800000000000808a), CONST64(0x8000000080008000),
+   CONST64(0x000000000000808b), CONST64(0x0000000080000001),
+   CONST64(0x8000000080008081), CONST64(0x8000000000008009),
+   CONST64(0x000000000000008a), CONST64(0x0000000000000088),
+   CONST64(0x0000000080008009), CONST64(0x000000008000000a),
+   CONST64(0x000000008000808b), CONST64(0x800000000000008b),
+   CONST64(0x8000000000008089), CONST64(0x8000000000008003),
+   CONST64(0x8000000000008002), CONST64(0x8000000000000080),
+   CONST64(0x000000000000800a), CONST64(0x800000008000000a),
+   CONST64(0x8000000080008081), CONST64(0x8000000000008080),
+   CONST64(0x0000000080000001), CONST64(0x8000000080008008)
+};
+
+static const unsigned s_keccakf_rotc[24] = {
+   1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44
+};
+
+static const unsigned s_keccakf_piln[24] = {
+   10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1
+};
+
+static LTC_INLINE void s_keccak_f(ulong64 s[25], int max_rounds, int rc_offset)
+{
+   int i, j, round;
+   ulong64 t, bc[5];
+
+   for(round = 0; round < max_rounds; round++) {
+      /* Theta */
+      for(i = 0; i < 5; i++) {
+         bc[i] = s[i] ^ s[i + 5] ^ s[i + 10] ^ s[i + 15] ^ s[i + 20];
+      }
+      for(i = 0; i < 5; i++) {
+         t = bc[(i + 4) % 5] ^ ROL64(bc[(i + 1) % 5], 1);
+         for(j = 0; j < 25; j += 5) {
+            s[j + i] ^= t;
+         }
+      }
+      /* Rho Pi */
+      t = s[1];
+      for(i = 0; i < 24; i++) {
+         j = s_keccakf_piln[i];
+         bc[0] = s[j];
+         s[j] = ROL64(t, s_keccakf_rotc[i]);
+         t = bc[0];
+      }
+      /* Chi */
+      for(j = 0; j < 25; j += 5) {
+         for(i = 0; i < 5; i++) {
+            bc[i] = s[j + i];
+         }
+         for(i = 0; i < 5; i++) {
+            s[j + i] ^= (~bc[(i + 1) % 5]) & bc[(i + 2) % 5];
+         }
+      }
+      /* Iota */
+      s[0] ^= s_keccakf_rndc[rc_offset + round];
+   }
+}
+
+static void s_keccakf(ulong64 s[25])
+{
+   s_keccak_f(s, SHA3_KECCAK_ROUNDS, SHA3_KECCAK_RC_OFFSET);
+}
+
+#if defined LTC_TURBO_SHAKE
+static void s_keccak_turbo_f(ulong64 s[25])
+{
+   s_keccak_f(s, SHA3_KECCAK_TURBO_ROUNDS, SHA3_KECCAK_TURBO_RC_OFFSET);
+}
+#endif
+
+
+static LTC_INLINE int s_sha3_done(struct sha3_state *sha3, unsigned char *hash, ulong64 pad)
+{
+   unsigned i;
+
+   LTC_ARGCHK(sha3 != NULL);
+   LTC_ARGCHK(hash != NULL);
+
+   sha3->s[sha3->word_index] ^= (sha3->saved ^ (pad << (sha3->byte_index * 8)));
+   sha3->s[SHA3_KECCAK_SPONGE_WORDS - sha3->capacity_words - 1] ^= CONST64(0x8000000000000000);
+   s_keccakf(sha3->s);
+
+   /* store s[] as little-endian bytes into sb */
+   for(i = 0; i < SHA3_KECCAK_SPONGE_WORDS; i++) {
+      STORE64L(sha3->s[i], sha3->sb + i * 8);
+   }
+
+   XMEMCPY(hash, sha3->sb, sha3->capacity_words * 4);
+   return CRYPT_OK;
+}
+
+/* Public Inteface */
+
+int sha3_224_init(hash_state *md)
+{
+   LTC_ARGCHK(md != NULL);
+   XMEMSET(&md->sha3, 0, sizeof(md->sha3));
+   md->sha3.capacity_words = 2 * 224 / (8 * sizeof(ulong64));
+   return CRYPT_OK;
+}
+
+int sha3_256_init(hash_state *md)
+{
+   LTC_ARGCHK(md != NULL);
+   XMEMSET(&md->sha3, 0, sizeof(md->sha3));
+   md->sha3.capacity_words = 2 * 256 / (8 * sizeof(ulong64));
+   return CRYPT_OK;
+}
+
+int sha3_384_init(hash_state *md)
+{
+   LTC_ARGCHK(md != NULL);
+   XMEMSET(&md->sha3, 0, sizeof(md->sha3));
+   md->sha3.capacity_words = 2 * 384 / (8 * sizeof(ulong64));
+   return CRYPT_OK;
+}
+
+int sha3_512_init(hash_state *md)
+{
+   LTC_ARGCHK(md != NULL);
+   XMEMSET(&md->sha3, 0, sizeof(md->sha3));
+   md->sha3.capacity_words = 2 * 512 / (8 * sizeof(ulong64));
+   return CRYPT_OK;
+}
+
+#ifdef LTC_SHA3
+static LTC_INLINE int s_sha3_shake_init(struct sha3_state *sha3, int num)
+{
+   LTC_ARGCHK(sha3 != NULL);
+   if (num != 128 && num != 256) return CRYPT_INVALID_ARG;
+   XMEMSET(sha3, 0, sizeof(*sha3));
+   sha3->capacity_words = (unsigned short)(2 * num / (8 * sizeof(ulong64)));
+   return CRYPT_OK;
+}
+
+int sha3_shake128_init(hash_state *md)
+{
+   return s_sha3_shake_init(&md->sha3, 128);
+}
+
+int sha3_shake256_init(hash_state *md)
+{
+   return s_sha3_shake_init(&md->sha3, 256);
+}
+
+int sha3_shake_init(hash_state *md, int num)
+{
+   return s_sha3_shake_init(&md->sha3, num);
+}
+#endif
+
+typedef void (*process_fn)(ulong64 s[25]);
+static LTC_INLINE int s_sha3_process(struct sha3_state *sha3, const unsigned char *in, unsigned long inlen, process_fn proc_f)
+{
+   unsigned long words;
+   unsigned old_tail, tail;
+   unsigned long i;
+
+   LTC_ARGCHK(sha3 != NULL);
+   LTC_ARGCHK(in   != NULL);
+
+   if (inlen == 0) return CRYPT_OK; /* nothing to do */
+
+   /* 0...7 -- how much is needed to have a word */
+   old_tail = (8 - sha3->byte_index) & 7;
+
+   if(inlen < old_tail) {       /* have no complete word or haven't started the word yet */
+      while (inlen--) sha3->saved |= (ulong64) (*(in++)) << ((sha3->byte_index++) * 8);
+      return CRYPT_OK;
+   }
+
+   if(old_tail) {               /* will have one word to process */
+      inlen -= old_tail;
+      while (old_tail--) sha3->saved |= (ulong64) (*(in++)) << ((sha3->byte_index++) * 8);
+      /* now ready to add saved to the sponge */
+      sha3->s[sha3->word_index] ^= sha3->saved;
+      sha3->byte_index = 0;
+      sha3->saved = 0;
+      if(++sha3->word_index == (SHA3_KECCAK_SPONGE_WORDS - sha3->capacity_words)) {
+         proc_f(sha3->s);
+         sha3->word_index = 0;
+      }
+   }
+
+   /* now work in full words directly from input */
+   words = inlen / sizeof(ulong64);
+   tail = inlen - words * sizeof(ulong64);
+
+   for(i = 0; i < words; i++, in += sizeof(ulong64)) {
+      ulong64 t;
+      LOAD64L(t, in);
+      sha3->s[sha3->word_index] ^= t;
+      if(++sha3->word_index == (SHA3_KECCAK_SPONGE_WORDS - sha3->capacity_words)) {
+         proc_f(sha3->s);
+         sha3->word_index = 0;
+      }
+   }
+
+   /* finally, save the partial word */
+   while (tail--) {
+      sha3->saved |= (ulong64) (*(in++)) << ((sha3->byte_index++) * 8);
+   }
+   return CRYPT_OK;
+}
+
+int sha3_process(hash_state *md, const unsigned char *in, unsigned long inlen)
+{
+   return s_sha3_process(&md->sha3, in, inlen, s_keccakf);
+}
+
+#if defined LTC_TURBO_SHAKE
+static LTC_INLINE int s_turbo_shake_process(struct sha3_state *sha3, const unsigned char *in, unsigned long inlen)
+{
+   return s_sha3_process(sha3, in, inlen, s_keccak_turbo_f);
+}
+
+int turbo_shake_process(hash_state *md, const unsigned char *in, unsigned long inlen)
+{
+   return s_turbo_shake_process(&md->sha3, in, inlen);
+}
+#endif
+
+#ifdef LTC_SHA3
+int sha3_done(hash_state *md, unsigned char *out)
+{
+   return s_sha3_done(&md->sha3, out, CONST64(0x06));
+}
+#endif
+
+#ifdef LTC_KECCAK
+int keccak_done(hash_state *md, unsigned char *out)
+{
+   return s_sha3_done(&md->sha3, out, CONST64(0x01));
+}
+#endif
+
+#ifdef LTC_SHA3
+static LTC_INLINE int s_sha3_shake_done(struct sha3_state *sha3, unsigned char *out, unsigned long outlen, unsigned char domain, process_fn proc_f)
+{
+   /* IMPORTANT NOTE: sha3_shake_done can be called many times */
+   unsigned long idx;
+   unsigned i;
+
+   if (outlen == 0) return CRYPT_OK; /* nothing to do */
+   LTC_ARGCHK(sha3 != NULL);
+   LTC_ARGCHK(out != NULL);
+
+   if (!sha3->xof_flag) {
+      /* shake_xof operation must be done only once */
+      sha3->s[sha3->word_index] ^= (sha3->saved ^ (((ulong64)(domain)) << (sha3->byte_index * 8)));
+      sha3->s[SHA3_KECCAK_SPONGE_WORDS - sha3->capacity_words - 1] ^= CONST64(0x8000000000000000);
+      proc_f(sha3->s);
+      /* store s[] as little-endian bytes into sb */
+      for(i = 0; i < SHA3_KECCAK_SPONGE_WORDS; i++) {
+         STORE64L(sha3->s[i], sha3->sb + i * 8);
+      }
+      sha3->byte_index = 0;
+      sha3->xof_flag = 1;
+   }
+
+   for (idx = 0; idx < outlen; idx++) {
+      if(sha3->byte_index >= (SHA3_KECCAK_SPONGE_WORDS - sha3->capacity_words) * 8) {
+         proc_f(sha3->s);
+         /* store s[] as little-endian bytes into sb */
+         for(i = 0; i < SHA3_KECCAK_SPONGE_WORDS; i++) {
+            STORE64L(sha3->s[i], sha3->sb + i * 8);
+         }
+         sha3->byte_index = 0;
+      }
+      out[idx] = sha3->sb[sha3->byte_index++];
+   }
+   return CRYPT_OK;
+}
+
+int sha3_shake_done(hash_state *md, unsigned char *out, unsigned long outlen)
+{
+   return s_sha3_shake_done(&md->sha3, out, outlen, 0x1f, s_keccakf);
+}
+
+#ifdef LTC_KMAC
+int sha3_shake_done_ex(hash_state *md, unsigned char *out, unsigned long outlen, unsigned char domain)
+{
+   return s_sha3_shake_done(&md->sha3, out, outlen, domain, s_keccakf);
+}
+#endif
+
+int sha3_shake128_done(hash_state *md, unsigned char *out)
+{
+   return sha3_shake_done(md, out, 32);
+}
+
+int sha3_shake256_done(hash_state *md, unsigned char *out)
+{
+   return sha3_shake_done(md, out, 64);
+}
+
+#if defined LTC_TURBO_SHAKE
+static LTC_INLINE int s_turbo_shake_done(struct sha3_state *sha3, unsigned char *out, unsigned long outlen)
+{
+   return s_sha3_shake_done(sha3, out, outlen, 0x1f, s_keccak_turbo_f);
+}
+int turbo_shake_done(hash_state *md, unsigned char *out, unsigned long outlen)
+{
+   return s_turbo_shake_done(&md->sha3, out, outlen);
+}
+#endif
+
+int sha3_shake_memory(int num, const unsigned char *in, unsigned long inlen, unsigned char *out, const unsigned long *outlen)
+{
+   hash_state md;
+   int err;
+   LTC_ARGCHK(in  != NULL);
+   LTC_ARGCHK(out != NULL);
+   LTC_ARGCHK(outlen != NULL);
+   if ((err = sha3_shake_init(&md, num))          != CRYPT_OK) return err;
+   if ((err = sha3_shake_process(&md, in, inlen)) != CRYPT_OK) return err;
+   if ((err = sha3_shake_done(&md, out, *outlen)) != CRYPT_OK) return err;
+   return CRYPT_OK;
+}
+#endif
+
+#ifdef LTC_KANGAROO_TWELVE
+
+static const unsigned char kangaroo_twelve_filler[] = { 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+int kangaroo_twelve_init(hash_state *md, int num)
+{
+   int err;
+
+   LTC_ARGCHK(md != NULL);
+   LTC_ARGCHK(num == 128 || num == 256);
+
+   if ((err = s_sha3_shake_init(&md->kt.outer, num)) != CRYPT_OK) return err;
+   if ((err = s_sha3_shake_init(&md->kt.inner, num)) != CRYPT_OK) return err;
+   md->kt.blocks_count = 0;
+   md->kt.customization_len = 0;
+   md->kt.remaining = 8 * 1024;
+   md->kt.phase = 0;
+   md->kt.finished = 0;
+   return CRYPT_OK;
+}
+
+static LTC_INLINE int s_kangaroo_twelve_process(hash_state *md, const unsigned char *in, unsigned long inlen)
+{
+   unsigned long rem;
+   unsigned long amount;
+   int err;
+   int variant;
+   int digest_len;
+   unsigned char digest_buf[64];
+
+   LTC_ARGCHK(md != NULL);
+   LTC_ARGCHK(in != NULL || inlen == 0);
+
+   if (md->kt.phase == 0)
+   {
+      rem = md->kt.remaining;
+      amount = rem < inlen ? rem : inlen;
+      md->kt.remaining -= amount;
+      if ((err = s_turbo_shake_process(&md->kt.outer, in, amount)) != CRYPT_OK) return err;
+      in += amount;
+      inlen -= amount;
+      if (md->kt.remaining == 0 && inlen != 0)
+      {
+         md->kt.remaining = 8 * 1024;
+         md->kt.phase = 1;
+         md->kt.blocks_count += 1;
+         if ((err = s_turbo_shake_process(&md->kt.outer, kangaroo_twelve_filler, sizeof(kangaroo_twelve_filler))) != CRYPT_OK) return err;
+      }
+   }
+   if (md->kt.phase == 1)
+   {
+      do
+      {
+         rem = md->kt.remaining;
+         amount = rem < inlen ? rem : inlen;
+         md->kt.remaining -= amount;
+         if ((err = s_turbo_shake_process(&md->kt.inner, in, amount)) != CRYPT_OK) return err;
+         in += amount;
+         inlen -= amount;
+         if (md->kt.remaining == 0 && inlen != 0)
+         {
+            md->kt.remaining = 8 * 1024;
+            md->kt.blocks_count += 1;
+            assert(md->kt.outer.capacity_words == 4 || md->kt.outer.capacity_words == 8);
+            variant = md->kt.outer.capacity_words == 4 ? 128 : 256;
+            digest_len = variant == 128 ? 32 : 64;
+            if ((err = s_sha3_shake_done(&md->kt.inner, digest_buf, digest_len, 0x0b, s_keccak_turbo_f)) != CRYPT_OK) return err;
+            if ((err = s_sha3_shake_init(&md->kt.inner, variant)) != CRYPT_OK) return err;
+            if ((err = s_turbo_shake_process(&md->kt.outer, digest_buf, digest_len)) != CRYPT_OK) return err;
+         }
+      } while (inlen != 0);
+   }
+   return CRYPT_OK;
+}
+
+int kangaroo_twelve_process(hash_state *md, const unsigned char *in, unsigned long inlen)
+{
+   LTC_ARGCHK(md != NULL);
+   LTC_ARGCHK(in != NULL || inlen == 0);
+   LTC_ARGCHK(md->kt.customization_len == 0);
+   LTC_ARGCHK(md->kt.finished == 0);
+
+   return s_kangaroo_twelve_process(md, in, inlen);
+}
+
+int kangaroo_twelve_customization(hash_state *md, const unsigned char *in, unsigned long inlen)
+{
+   LTC_ARGCHK(md != NULL);
+   LTC_ARGCHK(in != NULL || inlen == 0);
+   LTC_ARGCHK(md->kt.finished == 0);
+
+   md->kt.customization_len += inlen;
+   return s_kangaroo_twelve_process(md, in, inlen);
+}
+
+int kangaroo_twelve_done(hash_state *md, unsigned char *out, unsigned long outlen)
+{
+   int couner_len;
+   unsigned char couner_buf[sizeof(ulong64) + 1];
+   int err;
+   int variant;
+   int digest_len;
+   unsigned char digest_buf[64];
+   unsigned char ffff[2];
+   unsigned char domain;
+
+   LTC_ARGCHK(md != NULL);
+   LTC_ARGCHK(out != NULL || outlen == 0);
+
+   if (md->kt.finished == 0)
+   {
+      md->kt.finished = 1;
+      couner_len = 0;
+      while (md->kt.customization_len != 0)
+      {
+         couner_buf[LTC_ARRAY_SIZE(couner_buf) - 1 - 1 - couner_len] = md->kt.customization_len & 0xff;
+         md->kt.customization_len >>= 8;
+         ++couner_len;
+      }
+      couner_buf[LTC_ARRAY_SIZE(couner_buf) - 1] = couner_len;
+      if ((err = s_kangaroo_twelve_process(md, &couner_buf[LTC_ARRAY_SIZE(couner_buf) - 1 - couner_len], couner_len + 1)) != CRYPT_OK) return err;
+      if(md->kt.phase != 0)
+      {
+         assert(md->kt.outer.capacity_words == 4 || md->kt.outer.capacity_words == 8);
+         variant = md->kt.outer.capacity_words == 4 ? 128 : 256;
+         digest_len = variant == 128 ? 32 : 64;
+         if ((err = s_sha3_shake_done(&md->kt.inner, digest_buf, digest_len, 0x0b, s_keccak_turbo_f)) != CRYPT_OK) return err;
+         if ((err = s_turbo_shake_process(&md->kt.outer, digest_buf, digest_len)) != CRYPT_OK) return err;
+         couner_len = 0;
+         while (md->kt.blocks_count != 0)
+         {
+            couner_buf[LTC_ARRAY_SIZE(couner_buf) - 1 - 1 - couner_len] = md->kt.blocks_count & 0xff;
+            md->kt.blocks_count >>= 8;
+            ++couner_len;
+         }
+         couner_buf[LTC_ARRAY_SIZE(couner_buf) - 1] = couner_len;
+         if ((err = s_turbo_shake_process(&md->kt.outer, &couner_buf[LTC_ARRAY_SIZE(couner_buf) - 1 - couner_len], couner_len + 1)) != CRYPT_OK) return err;
+         ffff[0] = 0xff;
+         ffff[1] = 0xff;
+         if ((err = s_turbo_shake_process(&md->kt.outer, ffff, LTC_ARRAY_SIZE(ffff))) != CRYPT_OK) return err;
+      }
+   }
+   domain = md->kt.phase == 0 ? 0x07 : 0x06;
+   return s_sha3_shake_done(&md->kt.outer, out, outlen, domain, s_keccak_turbo_f);
+}
+
+#endif
+
+#endif

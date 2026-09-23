@@ -1,0 +1,2 @@
+#include "resource.h"
+IDR_COVER_PNG RCDATA "..\\assets\\FullCoverBO2-Offline.png"

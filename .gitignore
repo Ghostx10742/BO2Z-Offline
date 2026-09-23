@@ -1,0 +1,43 @@
+# Build products and local packaging
+/build/
+/out/
+/dist/
+/packages/
+/release/
+*.zip
+!/downloads/BO2Z-Offline-2.9.4.zip
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exp
+*.dmp
+
+# Never publish personal saves, local publisher caches, or diagnostics
+**/offline-profiles/
+**/profiles/
+**/bo2lan-data/
+**/BO2Z-Offline-data/
+**/data/pub/
+**/pub/
+**/*.log
+**/logs/
+**/diagnostics/
+**/backups/
+**/captures/
+**/*.pending-*
+**/owner.bin
+**/zmstatsCompressed*
+**/zmdatabk0000
+**/public-profile.bin
+**/board-*.bin
+
+# Local editor and platform files
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+desktop.ini

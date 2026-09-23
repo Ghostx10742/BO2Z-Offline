@@ -1,0 +1,89 @@
+/* LibTomCrypt, modular cryptographic library -- Tom St Denis */
+/* SPDX-License-Identifier: Unlicense */
+#include "tomcrypt_private.h"
+
+/**
+  @file der_length_object_identifier.c
+  ASN.1 DER, get length of Object Identifier, Tom St Denis
+*/
+
+#ifdef LTC_DER
+
+static LTC_INLINE unsigned long s_der_object_identifier_bits(unsigned long x)
+{
+#if defined(LTC_HAVE_CLZL_BUILTIN)
+   if (x == 0)
+      return 0;
+   return sizeof(unsigned long) * CHAR_BIT - __builtin_clzl(x);
+#else
+   unsigned long c;
+   c  = 0;
+   while (x) {
+     ++c;
+     x >>= 1;
+   }
+   return c;
+#endif
+}
+
+int der_length_object_identifier_full(const unsigned long *words, unsigned long nwords, unsigned long *outlen, unsigned long *datalen)
+{
+   unsigned long y, z, t, wordbuf;
+
+   LTC_ARGCHK(words  != NULL);
+   LTC_ARGCHK(outlen != NULL);
+
+
+   /* must be >= 2 words */
+   if (nwords < 2) {
+      return CRYPT_INVALID_ARG;
+   }
+
+   /* word1 = 0,1,2 and word2 0..39 */
+   if (words[0] > 2 || (words[0] < 2 && words[1] > 39)) {
+      return CRYPT_INVALID_ARG;
+   }
+
+   /* leading word is the first two */
+   z = 0;
+   wordbuf = words[0] * 40 + words[1];
+   for (y = 1; y < nwords; y++) {
+       t = s_der_object_identifier_bits(wordbuf);
+       z += t/7 + ((t%7) ? 1 : 0) + (wordbuf == 0 ? 1 : 0);
+       if (y < nwords - 1) {
+          /* grab next word */
+          wordbuf = words[y+1];
+       }
+   }
+
+   if (datalen) {
+      *datalen = z;
+   }
+   /* now depending on the length our length encoding changes */
+   if (z < 128) {
+      z += 2;
+   } else if (z < 256) {
+      z += 3;
+   } else if (z < 65536UL) {
+      z += 4;
+   } else {
+      return CRYPT_INVALID_ARG;
+   }
+
+   *outlen = z;
+   return CRYPT_OK;
+}
+
+/**
+  Gets length of DER encoding of Object Identifier
+  @param nwords   The number of OID words
+  @param words    The actual OID words to get the size of
+  @param outlen   [out] The length of the DER encoding for the given string
+  @return CRYPT_OK if successful
+*/
+int der_length_object_identifier(const unsigned long *words, unsigned long nwords, unsigned long *outlen)
+{
+   return der_length_object_identifier_full(words, nwords, outlen, NULL);
+}
+
+#endif

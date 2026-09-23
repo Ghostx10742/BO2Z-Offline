@@ -1,0 +1,34 @@
+#!/bin/sh
+
+RELDIR="/$0"
+RELDIR="${RELDIR%/*}"
+RELDIR="${RELDIR:-.}"
+RELDIR="${RELDIR##/}/"
+
+BINDIR=`cd "$RELDIR"; pwd`
+
+err_out() {
+	err=$1
+	shift
+	echo $* >&2
+	exit $err
+}
+
+usage() {
+	cat >&$(($1 + 1)) << EOF
+Available commands are:
+`ls -1 $BINDIR/ltc-* | sed "s@$BINDIR/ltc-@    @g"`
+    help
+EOF
+	exit $1
+}
+
+[ $# -gt 0 ] || usage 1
+
+TOOL="$1"
+shift
+[ "$TOOL" == "help" ] || [ "$TOOL" == "--help" ] || [ "$TOOL" == "-h" ] && usage 0
+
+test -x "$BINDIR/ltc-$TOOL" || err_out 1 "Unknown command: $TOOL"
+
+[ $# -gt 0 ] && "$BINDIR/ltc-$TOOL" "$@" || "$BINDIR/ltc-$TOOL"
