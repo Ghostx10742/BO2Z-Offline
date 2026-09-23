@@ -1,7 +1,5 @@
-#include "resource.h"
-#include "../src/version.h"
+#include "version.h"
 #include <winver.h>
-IDR_COVER_PNG RCDATA "..\\assets\\FullCoverBO2-Offline.png"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION BO2Z_VERSION_COMMA
@@ -9,7 +7,7 @@ VS_VERSION_INFO VERSIONINFO
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0
  FILEOS VOS__WINDOWS32
- FILETYPE VFT_APP
+ FILETYPE VFT_DLL
  FILESUBTYPE 0
 BEGIN
     BLOCK "StringFileInfo"
@@ -17,7 +15,7 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName", "J_axon\0"
-            VALUE "FileDescription", "BO2Z-Offline Launcher\0"
+            VALUE "FileDescription", "BO2Z-Offline local service backend\0"
             VALUE "FileVersion", BO2Z_VERSION_STRING
             VALUE "ProductName", "BO2Z-Offline\0"
             VALUE "ProductVersion", BO2Z_VERSION_STRING

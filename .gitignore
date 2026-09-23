@@ -5,7 +5,7 @@
 /packages/
 /release/
 *.zip
-!/downloads/BO2Z-Offline-2.9.4.zip
+!/downloads/BO2Z-Offline-1.0.0.zip
 *.dll
 *.exe
 *.pdb

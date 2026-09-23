@@ -1,12 +1,10 @@
 param(
-    [string] $VerifiedBackendPath,
-    [string] $VerifiedLauncherPath,
     [string] $OutputZip
 )
 
 $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
-$version = '2.9.4'
+$version = '1.0.0'
 $publisher = Join-Path $project 'resources/publisher'
 $staging = Join-Path $project "dist/release-stage-$version"
 $zip = if ($OutputZip) { $OutputZip }
@@ -34,22 +32,10 @@ foreach ($name in $expected.Keys) {
     }
 }
 
-$launcher = if ($VerifiedLauncherPath) { (Resolve-Path -LiteralPath $VerifiedLauncherPath).Path }
-            else { Join-Path $project 'build/Release/BO2Z-Offline-Launcher.exe' }
-$backend = if ($VerifiedBackendPath) { (Resolve-Path -LiteralPath $VerifiedBackendPath).Path }
-           else { Join-Path $project 'build/Release/BO2Z-Offline.dll' }
+$launcher = Join-Path $project 'build/Release/BO2Z-Offline-Launcher.exe'
+$backend = Join-Path $project 'build/Release/BO2Z-Offline.dll'
 foreach ($path in @($launcher, $backend)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Build output missing: $path" }
-}
-if ($VerifiedBackendPath -and
-    (Get-FileHash -LiteralPath $backend -Algorithm SHA256).Hash -ne
-    'CF9D10AD4CD6639F029D5E29A28416BB051A3616AAA8E4EA9569F3E395CD16AA') {
-    throw 'Verified backend path does not contain the previously live-tested DLL.'
-}
-if ($VerifiedLauncherPath -and
-    (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash -ne
-    '42180F8112C86A30DE02D400536232311091FF3067E78BAE6C7F4B798EF9EC92') {
-    throw 'Verified launcher path does not contain the previously live-tested EXE.'
 }
 
 $drop = Join-Path $staging 'Copy into Black Ops II folder'
@@ -71,8 +57,8 @@ $files = @(Get-ChildItem -LiteralPath $staging -Recurse -File | ForEach-Object {
 if ($files.Count -ne 15) { throw "Unexpected release file count: $($files.Count)" }
 $manifest = @{
     name = 'BO2Z-Offline'; version = $version;
-    backend = $(if ($VerifiedBackendPath) { 'previously live-tested backend' } else { 'fresh source build' });
-    launcher = $(if ($VerifiedLauncherPath) { 'previously live-tested launcher' } else { 'fresh source build' });
+    backend = 'fresh 1.0.0 source build';
+    launcher = 'fresh 1.0.0 source build';
     personalProfilesIncluded = $false; logsIncluded = $false; files = $files
 }
 $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $staging 'MANIFEST.json') -Encoding utf8

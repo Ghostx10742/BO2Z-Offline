@@ -2,6 +2,7 @@
 #include "offline_storage.h"
 #include "log.h"
 #include "launcher_bootstrap.h"
+#include "version.h"
 #include <windows.h>
 
 extern "C" __declspec(dllexport) void __cdecl OfflineOpStart();
@@ -15,7 +16,7 @@ bool StartOffline() {
     const wchar_t* name=wcsrchr(path,L'\\');name=name?name+1:path;
     if(_wcsicmp(name,L"t6zm.exe")){InterlockedExchange(&g_started,3);return false;}
     Log_Init();
-    Log("BO2Z-Offline 2.9.4 Steam-launched direct bootstrap; launcher-owned status indicator");
+    Log("BO2Z-Offline %s Steam-launched direct bootstrap; launcher-owned status indicator", BO2Z_VERSION_STRING);
     bo2lan::offline::ConfigureIsolatedProfilePolicy();
     const bool started=bo2lan::StartBackend();
     if(!started)Log("Offline backend initialization failed; no success handshake was sent");
