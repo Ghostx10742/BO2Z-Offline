@@ -1,0 +1,108 @@
+/* LibTomCrypt, modular cryptographic library -- Tom St Denis */
+/* SPDX-License-Identifier: Unlicense */
+#include "tomcrypt_private.h"
+
+/**
+  @file pkcs_1_mgf1.c
+  The Mask Generation Function (MGF1) for PKCS #1, Tom St Denis
+*/
+
+#ifdef LTC_PKCS_1
+
+/**
+   Perform PKCS #1 MGF1 (internal)
+   @param hash_idx    The index of the hash desired
+   @param seed        The seed for MGF1
+   @param seedlen     The length of the seed
+   @param mask        [out] The destination
+   @param masklen     The length of the mask desired
+   @return CRYPT_OK if successful
+
+   BEWARE: When hash_idx selects shake128 or shake256, this uses
+   SHAKE directly instead of MGF1(SHAKE), as required by RFC 8702.
+*/
+int ltc_pkcs_1_mgf1(int                  hash_idx,
+                    const unsigned char *seed, unsigned long seedlen,
+                          unsigned char *mask, unsigned long masklen)
+{
+   unsigned long hLen, x;
+   ulong32       counter;
+   int           err;
+   hash_state    *md;
+   unsigned char *buf;
+
+   LTC_ARGCHK(seed != NULL);
+   LTC_ARGCHK(mask != NULL);
+
+   /* ensure valid hash */
+   if ((err = hash_is_valid(hash_idx)) != CRYPT_OK) {
+      return err;
+   }
+
+#ifdef LTC_SHA3
+   if (hash_descriptor[hash_idx].ID == shake128_desc.ID
+         || hash_descriptor[hash_idx].ID == shake256_desc.ID) {
+      /* The output hashsize is double the announced SHAKE bitsize
+       * and given in octets, so only multiply by 4 to arrive at 128 resp. 256. */
+      return sha3_shake_memory(hash_descriptor[hash_idx].hashsize * 4, seed, seedlen, mask, &masklen);
+   }
+#endif
+
+   /* get hash output size */
+   hLen = hash_descriptor[hash_idx].hashsize;
+
+   /* allocate memory */
+   md  = XMALLOC(sizeof(hash_state));
+   buf = XMALLOC(hLen);
+   if (md == NULL || buf == NULL) {
+      if (md != NULL) {
+         XFREE(md);
+      }
+      if (buf != NULL) {
+         XFREE(buf);
+      }
+      return CRYPT_MEM;
+   }
+
+   /* start counter */
+   counter = 0;
+
+   while (masklen > 0) {
+       /* handle counter */
+       STORE32H(counter, buf);
+       ++counter;
+
+       /* get hash of seed || counter */
+       if ((err = hash_descriptor[hash_idx].init(md)) != CRYPT_OK) {
+          goto LBL_ERR;
+       }
+       if ((err = hash_descriptor[hash_idx].process(md, seed, seedlen)) != CRYPT_OK) {
+          goto LBL_ERR;
+       }
+       if ((err = hash_descriptor[hash_idx].process(md, buf, 4)) != CRYPT_OK) {
+          goto LBL_ERR;
+       }
+       if ((err = hash_descriptor[hash_idx].done(md, buf)) != CRYPT_OK) {
+          goto LBL_ERR;
+       }
+
+       /* store it */
+       for (x = 0; x < hLen && masklen > 0; x++, masklen--) {
+          *mask++ = buf[x];
+       }
+   }
+
+   err = CRYPT_OK;
+LBL_ERR:
+#ifdef LTC_CLEAN_STACK
+   zeromem(buf, hLen);
+   zeromem(md,  sizeof(hash_state));
+#endif
+
+   XFREE(buf);
+   XFREE(md);
+
+   return err;
+}
+
+#endif /* LTC_PKCS_1 */

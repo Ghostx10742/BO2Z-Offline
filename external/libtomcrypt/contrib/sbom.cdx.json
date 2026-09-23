@@ -1,0 +1,40 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "version": 1,
+  "metadata": {
+    "authors": [
+      {
+        "name": "@VCS_SBOM_AUTHORS@"
+      }
+    ]
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "pkg:github/libtom/libtomcrypt@@VCS_TAG@",
+      "cpe": "cpe:2.3:a:libtom:libtomcrypt:@VCS_TAG@:*:*:*:*:*:*:*",
+      "name": "libtomcrypt",
+      "version": "@VCS_VERSION@",
+      "description": "Modular and portable cryptographic toolkit",
+      "authors": [
+        {
+          "name": "libtomcrypt developers"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "Unlicense"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/libtom/libtomcrypt"
+        }
+      ]
+    }
+  ]
+}

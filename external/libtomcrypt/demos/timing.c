@@ -1,0 +1,1652 @@
+/* LibTomCrypt, modular cryptographic library -- Tom St Denis */
+/* SPDX-License-Identifier: Unlicense */
+#include "tomcrypt_private.h"
+
+#if defined(_WIN32)
+   #define PRI64  "I64d"
+#else
+   #define PRI64  "ll"
+#endif
+
+static prng_state timing_prng;
+static const char *timing_prng_name;
+static int timing_prng_id;
+
+/* timing */
+#define KTIMES  25
+#define TIMES   100000
+
+static const char *filter_arg;
+
+static LTC_INLINE int should_skip(const char *name)
+{
+   if (name && filter_arg && strstr(name, filter_arg) == NULL)
+      return 1;
+   return 0;
+}
+
+static struct list {
+    int id;
+    ulong64 spd1, spd2, avg;
+} results[100];
+static int no_results;
+
+static int sorter(const void *a, const void *b)
+{
+   const struct list *A, *B;
+   A = a;
+   B = b;
+   if (A->avg < B->avg) return -1;
+   if (A->avg > B->avg) return 1;
+   return 0;
+}
+
+static void tally_results(int type)
+{
+   int x;
+
+   /* qsort the results */
+   qsort(results, no_results, sizeof(struct list), &sorter);
+
+   fprintf(stderr, "\n");
+   if (type == 0) {
+      for (x = 0; x < no_results; x++) {
+         fprintf(stderr, "%-20s: Schedule at %6lu\n", cipher_descriptor[results[x].id].name, (unsigned long)results[x].spd1);
+      }
+   } else if (type == 1) {
+      for (x = 0; x < no_results; x++) {
+        printf
+          ("%-20s[%3d]: Encrypt at %5"PRI64"u, Decrypt at %5"PRI64"u\n", cipher_descriptor[results[x].id].name, cipher_descriptor[results[x].id].ID, results[x].spd1, results[x].spd2);
+      }
+   } else {
+      for (x = 0; x < no_results; x++) {
+        printf
+          ("%-20s: Process at %5"PRI64"u\n", hash_descriptor[results[x].id].name, results[x].spd1 / 1000);
+      }
+   }
+}
+
+/* RDTSC from Scott Duplichan */
+static LTC_INLINE ulong64 rdtsc (void)
+   {
+   #if defined __GNUC__ && !defined(LTC_NO_ASM)
+      #if defined(__i386__) || defined(__x86_64__)
+         /* version from http://www.mcs.anl.gov/~kazutomo/rdtsc.html
+          * the old code always got a warning issued by gcc, clang did not complain...
+          */
+         unsigned hi, lo;
+         __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
+         return ((ulong64)lo)|( ((ulong64)hi)<<32);
+      #elif defined(LTC_PPC32) || defined(TFM_PPC32)
+         unsigned long a, b;
+         __asm__ __volatile__ ("mftbu %1 \nmftb %0\n":"=r"(a), "=r"(b));
+         return (((ulong64)b) << 32ULL) | ((ulong64)a);
+      #elif defined(__ia64__)  /* gcc-IA64 version */
+         unsigned long result;
+         __asm__ __volatile__("mov %0=ar.itc" : "=r"(result) :: "memory");
+         while (__builtin_expect ((int) result == -1, 0))
+         __asm__ __volatile__("mov %0=ar.itc" : "=r"(result) :: "memory");
+         return result;
+      #elif defined(__sparc__)
+         #if defined(__arch64__)
+           ulong64 a;
+           asm volatile("rd %%tick,%0" : "=r" (a));
+           return a;
+         #else
+           register unsigned long x, y;
+           __asm__ __volatile__ ("rd %%tick, %0; clruw %0, %1; srlx %0, 32, %0" : "=r" (x), "=r" (y) : "0" (x), "1" (y));
+           return ((unsigned long long) x << 32) | y;
+         #endif
+      #elif defined(__aarch64__)
+         ulong64 CNTVCT_EL0;
+         __asm__ __volatile__ ("mrs %0, cntvct_el0" : "=r"(CNTVCT_EL0));
+         return CNTVCT_EL0;
+      #else
+         return XCLOCK();
+      #endif
+
+   /* Microsoft and Intel Windows compilers */
+   #elif defined _M_IX86 && !defined(LTC_NO_ASM)
+     __asm rdtsc
+   #elif defined _M_AMD64 && !defined(LTC_NO_ASM)
+     return __rdtsc ();
+   #elif defined _M_IA64 && !defined(LTC_NO_ASM)
+     #if defined __INTEL_COMPILER
+       #include <ia64intrin.h>
+     #endif
+      return __getReg (3116);
+   #else
+     return XCLOCK();
+   #endif
+   }
+
+static ulong64 timer, skew = 0;
+
+static LTC_INLINE void t_start(void)
+{
+   timer = rdtsc();
+}
+
+static LTC_INLINE ulong64 t_read(void)
+{
+   return rdtsc() - timer;
+}
+
+static void init_timer(void)
+{
+   ulong64 c1, c2, t1, t2;
+   unsigned long y1;
+
+   c1 = c2 = (ulong64)-1;
+   for (y1 = 0; y1 < TIMES*100; y1++) {
+      t_start();
+      t1 = t_read();
+      t2 = (t_read() - t1)>>1;
+
+      c1 = (t1 > c1) ? t1 : c1;
+      c2 = (t2 > c2) ? t2 : c2;
+   }
+   skew = c2 - c1;
+   fprintf(stderr, "Clock Skew: %lu\n", (unsigned long)skew);
+}
+
+static void time_keysched(void)
+{
+  unsigned long x, y1;
+  ulong64 t1, c1;
+  symmetric_key skey;
+  int kl;
+  int    (*func) (const unsigned char *, int , int , symmetric_key *);
+  unsigned char key[MAXBLOCKSIZE];
+
+  fprintf(stderr, "\n\nKey Schedule Time Trials for the Symmetric Ciphers:\n(Times are cycles per key)\n");
+  no_results = 0;
+ for (x = 0; cipher_descriptor[x].name != NULL; x++) {
+#define DO1(k)   func(k, kl, 0, &skey);
+
+    func = cipher_descriptor[x].setup;
+    kl   = cipher_descriptor[x].min_key_length;
+    c1 = (ulong64)-1;
+    for (y1 = 0; y1 < KTIMES; y1++) {
+       prng_descriptor[timing_prng_id].read(key, kl, &timing_prng);
+       t_start();
+       DO1(key);
+       t1 = t_read();
+       c1 = (t1 > c1) ? c1 : t1;
+    }
+    t1 = c1 - skew;
+    results[no_results].spd1 = results[no_results].avg = t1;
+    results[no_results++].id = x;
+    fprintf(stderr, "."); fflush(stdout);
+
+#undef DO1
+   }
+   tally_results(0);
+}
+
+#ifdef LTC_ECB_MODE
+static void time_cipher_ecb(void)
+{
+  unsigned long x, y1;
+  ulong64  t1, t2, c1, c2, a1, a2;
+  symmetric_ECB ecb;
+  unsigned char key[MAXBLOCKSIZE] = { 0 }, pt[4096] = { 0 };
+  int err;
+
+  fprintf(stderr, "\n\nECB Time Trials for the Symmetric Ciphers:\n");
+  no_results = 0;
+  for (x = 0; cipher_descriptor[x].name != NULL; x++) {
+    if (should_skip(cipher_descriptor[x].name))
+       continue;
+
+    ecb_start(x, key, cipher_descriptor[x].min_key_length, 0, &ecb);
+
+    /* sanity check on cipher */
+    if ((err = cipher_descriptor[x].test()) != CRYPT_OK) {
+       fprintf(stderr, "\n\nERROR: Cipher %s failed self-test %s\n", cipher_descriptor[x].name, error_to_string(err));
+       exit(EXIT_FAILURE);
+    }
+
+#define DO1   ecb_encrypt(pt, pt, sizeof(pt), &ecb);
+#define DO2   DO1 DO1
+
+    c1 = c2 = (ulong64)-1;
+    for (y1 = 0; y1 < 100; y1++) {
+        t_start();
+        DO1;
+        t1 = t_read();
+        DO2;
+        t2 = t_read();
+        t2 -= t1;
+
+        c1 = (t1 > c1 ? c1 : t1);
+        c2 = (t2 > c2 ? c2 : t2);
+    }
+    a1 = c2 - c1 - skew;
+
+#undef DO1
+#undef DO2
+#define DO1   ecb_decrypt(pt, pt, sizeof(pt), &ecb);
+#define DO2   DO1 DO1
+
+    c1 = c2 = (ulong64)-1;
+    for (y1 = 0; y1 < 100; y1++) {
+        t_start();
+        DO1;
+        t1 = t_read();
+        DO2;
+        t2 = t_read();
+        t2 -= t1;
+
+        c1 = (t1 > c1 ? c1 : t1);
+        c2 = (t2 > c2 ? c2 : t2);
+    }
+    a2 = c2 - c1 - skew;
+    ecb_done(&ecb);
+
+    results[no_results].id = x;
+    results[no_results].spd1 = a1/(sizeof(pt)/cipher_descriptor[x].block_length);
+    results[no_results].spd2 = a2/(sizeof(pt)/cipher_descriptor[x].block_length);
+    results[no_results].avg = (results[no_results].spd1 + results[no_results].spd2+1)/2;
+    ++no_results;
+    fprintf(stderr, "."); fflush(stdout);
+
+#undef DO2
+#undef DO1
+   }
+   tally_results(1);
+}
+#else
+static void time_cipher_ecb(void) { fprintf(stderr, "NO ECB\n"); return 0; }
+#endif
+
+#ifdef LTC_CBC_MODE
+static void time_cipher_cbc(void)
+{
+  unsigned long x, y1;
+  ulong64  t1, t2, c1, c2, a1, a2;
+  symmetric_CBC cbc;
+  unsigned char key[MAXBLOCKSIZE] = { 0 }, pt[4096] = { 0 };
+  int err;
+
+  fprintf(stderr, "\n\nCBC Time Trials for the Symmetric Ciphers:\n");
+  no_results = 0;
+  for (x = 0; cipher_descriptor[x].name != NULL; x++) {
+    if (should_skip(cipher_descriptor[x].name))
+       continue;
+
+    cbc_start(x, pt, key, cipher_descriptor[x].min_key_length, 0, &cbc);
+
+    /* sanity check on cipher */
+    if ((err = cipher_descriptor[x].test()) != CRYPT_OK) {
+       fprintf(stderr, "\n\nERROR: Cipher %s failed self-test %s\n", cipher_descriptor[x].name, error_to_string(err));
+       exit(EXIT_FAILURE);
+    }
+
+#define DO1   cbc_encrypt(pt, pt, sizeof(pt), &cbc);
+#define DO2   DO1 DO1
+
+    c1 = c2 = (ulong64)-1;
+    for (y1 = 0; y1 < 100; y1++) {
+        t_start();
+        DO1;
+        t1 = t_read();
+        DO2;
+        t2 = t_read();
+        t2 -= t1;
+
+        c1 = (t1 > c1 ? c1 : t1);
+        c2 = (t2 > c2 ? c2 : t2);
+    }
+    a1 = c2 - c1 - skew;
+
+#undef DO1
+#undef DO2
+#define DO1   cbc_decrypt(pt, pt, sizeof(pt), &cbc);
+#define DO2   DO1 DO1
+
+    c1 = c2 = (ulong64)-1;
+    for (y1 = 0; y1 < 100; y1++) {
+        t_start();
+        DO1;
+        t1 = t_read();
+        DO2;
+        t2 = t_read();
+        t2 -= t1;
+
+        c1 = (t1 > c1 ? c1 : t1);
+        c2 = (t2 > c2 ? c2 : t2);
+    }
+    a2 = c2 - c1 - skew;
+    cbc_done(&cbc);
+
+    results[no_results].id = x;
+    results[no_results].spd1 = a1/(sizeof(pt)/cipher_descriptor[x].block_length);
+    results[no_results].spd2 = a2/(sizeof(pt)/cipher_descriptor[x].block_length);
+    results[no_results].avg = (results[no_results].spd1 + results[no_results].spd2+1)/2;
+    ++no_results;
+    fprintf(stderr, "."); fflush(stdout);
+
+#undef DO2
+#undef DO1
+   }
+   tally_results(1);
+}
+#else
+static void time_cipher_cbc(void) { fprintf(stderr, "NO CBC\n"); return 0; }
+#endif
+
+#ifdef LTC_CTR_MODE
+static void time_cipher_ctr(void)
+{
+  unsigned long x, y1;
+  ulong64  t1, t2, c1, c2, a1, a2;
+  symmetric_CTR ctr;
+  unsigned char key[MAXBLOCKSIZE] = { 0 }, pt[4096] = { 0 };
+  int err;
+
+  fprintf(stderr, "\n\nCTR Time Trials for the Symmetric Ciphers:\n");
+  no_results = 0;
+  for (x = 0; cipher_descriptor[x].name != NULL; x++) {
+    if (should_skip(cipher_descriptor[x].name))
+       continue;
+
+    ctr_start(x, pt, key, cipher_descriptor[x].min_key_length, 0, CTR_COUNTER_LITTLE_ENDIAN, &ctr);
+
+    /* sanity check on cipher */
+    if ((err = cipher_descriptor[x].test()) != CRYPT_OK) {
+       fprintf(stderr, "\n\nERROR: Cipher %s failed self-test %s\n", cipher_descriptor[x].name, error_to_string(err));
+       exit(EXIT_FAILURE);
+    }
+
+#define DO1   ctr_encrypt(pt, pt, sizeof(pt), &ctr);
+#define DO2   DO1 DO1
+
+    c1 = c2 = (ulong64)-1;
+    for (y1 = 0; y1 < 100; y1++) {
+        t_start();
+        DO1;
+        t1 = t_read();
+        DO2;
+        t2 = t_read();
+        t2 -= t1;
+
+        c1 = (t1 > c1 ? c1 : t1);
+        c2 = (t2 > c2 ? c2 : t2);
+    }
+    a1 = c2 - c1 - skew;
+
+#undef DO1
+#undef DO2
+#define DO1   ctr_decrypt(pt, pt, sizeof(pt), &ctr);
+#define DO2   DO1 DO1
+
+    c1 = c2 = (ulong64)-1;
+    for (y1 = 0; y1 < 100; y1++) {
+        t_start();
+        DO1;
+        t1 = t_read();
+        DO2;
+        t2 = t_read();
+        t2 -= t1;
+
+        c1 = (t1 > c1 ? c1 : t1);
+        c2 = (t2 > c2 ? c2 : t2);
+    }
+    a2 = c2 - c1 - skew;
+    ctr_done(&ctr);
+
+    results[no_results].id = x;
+    results[no_results].spd1 = a1/(sizeof(pt)/cipher_descriptor[x].block_length);
+    results[no_results].spd2 = a2/(sizeof(pt)/cipher_descriptor[x].block_length);
+    results[no_results].avg = (results[no_results].spd1 + results[no_results].spd2+1)/2;
+    ++no_results;
+    fprintf(stderr, "."); fflush(stdout);
+
+#undef DO2
+#undef DO1
+   }
+   tally_results(1);
+}
+#else
+static void time_cipher_ctr(void) { fprintf(stderr, "NO CTR\n"); return 0; }
+#endif
+
+#ifdef LTC_LRW_MODE
+static void time_cipher_lrw(void)
+{
+  unsigned long x, y1;
+  ulong64  t1, t2, c1, c2, a1, a2;
+  symmetric_LRW lrw;
+  unsigned char key[MAXBLOCKSIZE] = { 0 }, pt[4096] = { 0 };
+  int err;
+
+  fprintf(stderr, "\n\nLRW Time Trials for the Symmetric Ciphers:\n");
+  no_results = 0;
+  for (x = 0; cipher_descriptor[x].name != NULL; x++) {
+    if (cipher_descriptor[x].block_length != 16) continue;
+    if (should_skip(cipher_descriptor[x].name))
+       continue;
+
+    lrw_start(x, pt, key, cipher_descriptor[x].min_key_length, key, 0, &lrw);
+
+    /* sanity check on cipher */
+    if ((err = cipher_descriptor[x].test()) != CRYPT_OK) {
+       fprintf(stderr, "\n\nERROR: Cipher %s failed self-test %s\n", cipher_descriptor[x].name, error_to_string(err));
+       exit(EXIT_FAILURE);
+    }
+
+#define DO1   lrw_encrypt(pt, pt, sizeof(pt), &lrw);
+#define DO2   DO1 DO1
+
+    c1 = c2 = (ulong64)-1;
+    for (y1 = 0; y1 < 100; y1++) {
+        t_start();
+        DO1;
+        t1 = t_read();
+        DO2;
+        t2 = t_read();
+        t2 -= t1;
+
+        c1 = (t1 > c1 ? c1 : t1);
+        c2 = (t2 > c2 ? c2 : t2);
+    }
+    a1 = c2 - c1 - skew;
+
+#undef DO1
+#undef DO2
+#define DO1   lrw_decrypt(pt, pt, sizeof(pt), &lrw);
+#define DO2   DO1 DO1
+
+    c1 = c2 = (ulong64)-1;
+    for (y1 = 0; y1 < 100; y1++) {
+        t_start();
+        DO1;
+        t1 = t_read();
+        DO2;
+        t2 = t_read();
+        t2 -= t1;
+
+        c1 = (t1 > c1 ? c1 : t1);
+        c2 = (t2 > c2 ? c2 : t2);
+    }
+    a2 = c2 - c1 - skew;
+
+    lrw_done(&lrw);
+
+    results[no_results].id = x;
+    results[no_results].spd1 = a1/(sizeof(pt)/cipher_descriptor[x].block_length);
+    results[no_results].spd2 = a2/(sizeof(pt)/cipher_descriptor[x].block_length);
+    results[no_results].avg = (results[no_results].spd1 + results[no_results].spd2+1)/2;
+    ++no_results;
+    fprintf(stderr, "."); fflush(stdout);
+
+#undef DO2
+#undef DO1
+   }
+   tally_results(1);
+}
+#else
+static void time_cipher_lrw(void) { fprintf(stderr, "NO LRW\n"); }
+#endif
+
+
+static void time_hash(void)
+{
+  unsigned long x, y1, len = 1024;
+  ulong64 t1, t2, c1, c2;
+  hash_state md;
+  int    (*func)(hash_state *, const unsigned char *, unsigned long), err;
+  unsigned char *pt = XMALLOC(len);
+  if (pt == NULL) {
+     fprintf(stderr, "\n\nout of heap yo\n\n");
+     exit(EXIT_FAILURE);
+  }
+
+  fprintf(stderr, "\n\nHASH Time Trials for:\n");
+  no_results = 0;
+  for (x = 0; hash_descriptor[x].name != NULL; x++) {
+     if (should_skip(hash_descriptor[x].name))
+        continue;
+
+    /* sanity check on hash */
+    if ((err = hash_descriptor[x].test()) != CRYPT_OK) {
+       fprintf(stderr, "\n\nERROR: Hash %s failed self-test %s\n", hash_descriptor[x].name, error_to_string(err));
+       XFREE(pt);
+       exit(EXIT_FAILURE);
+    }
+
+    hash_descriptor[x].init(&md);
+
+#define DO1   func(&md,pt,len);
+#define DO2   DO1 DO1
+
+    func = hash_descriptor[x].process;
+
+    c1 = c2 = (ulong64)-1;
+    for (y1 = 0; y1 < TIMES; y1++) {
+       t_start();
+       DO1;
+       t1 = t_read();
+       DO2;
+       t2 = t_read() - t1;
+       c1 = (t1 > c1) ? c1 : t1;
+       c2 = (t2 > c2) ? c2 : t2;
+    }
+    t1 = c2 - c1 - skew;
+    t1 = ((t1 * CONST64(1000))) / ((ulong64)hash_descriptor[x].blocksize);
+    results[no_results].id = x;
+    results[no_results].spd1 = results[no_results].avg = t1;
+    ++no_results;
+    fprintf(stderr, "."); fflush(stdout);
+#undef DO2
+#undef DO1
+   }
+   tally_results(2);
+   XFREE(pt);
+}
+
+/*#warning you need an mp_rand!!!*/
+
+static void time_mult(void)
+{
+   ulong64 t1, t2;
+   unsigned long x, y;
+   void  *a, *b, *c;
+
+   if (ltc_mp.name == NULL) return;
+
+   fprintf(stderr, "Timing Multiplying:\n");
+   ltc_mp_init_multi(&a,&b,&c,NULL);
+   for (x = 128/LTC_MP_DIGIT_BIT; x <= (unsigned long)1536/LTC_MP_DIGIT_BIT; x += 128/LTC_MP_DIGIT_BIT) {
+       ltc_mp_rand(a, x);
+       ltc_mp_rand(b, x);
+
+#define DO1 ltc_mp_mul(a, b, c);
+#define DO2 DO1; DO1;
+
+       t2 = -1;
+       for (y = 0; y < TIMES; y++) {
+           t_start();
+           t1 = t_read();
+           DO2;
+           t1 = (t_read() - t1)>>1;
+           if (t1 < t2) t2 = t1;
+       }
+       fprintf(stderr, "%4lu bits: %9"PRI64"u cycles\n", x*LTC_MP_DIGIT_BIT, t2);
+   }
+   ltc_mp_deinit_multi(a,b,c,NULL);
+
+#undef DO1
+#undef DO2
+}
+
+static void time_sqr(void)
+{
+   ulong64 t1, t2;
+   unsigned long x, y;
+   void *a, *b;
+
+   if (ltc_mp.name == NULL) return;
+
+   fprintf(stderr, "Timing Squaring:\n");
+   ltc_mp_init_multi(&a,&b,NULL);
+   for (x = 128/LTC_MP_DIGIT_BIT; x <= (unsigned long)1536/LTC_MP_DIGIT_BIT; x += 128/LTC_MP_DIGIT_BIT) {
+       ltc_mp_rand(a, x);
+
+#define DO1 ltc_mp_sqr(a, b);
+#define DO2 DO1; DO1;
+
+       t2 = -1;
+       for (y = 0; y < TIMES; y++) {
+           t_start();
+           t1 = t_read();
+           DO2;
+           t1 = (t_read() - t1)>>1;
+           if (t1 < t2) t2 = t1;
+       }
+       fprintf(stderr, "%4lu bits: %9"PRI64"u cycles\n", x*LTC_MP_DIGIT_BIT, t2);
+   }
+   ltc_mp_deinit_multi(a,b,NULL);
+
+#undef DO1
+#undef DO2
+}
+
+static void time_prng(void)
+{
+   ulong64 t1, t2;
+   unsigned char buf[4096];
+   prng_state tprng;
+   unsigned long x, y;
+   int           err;
+
+   fprintf(stderr, "Timing PRNGs - cycles/byte output, cycles add_entropy (32 bytes) :\n");
+   for (x = 0; prng_descriptor[x].name != NULL; x++) {
+      if (should_skip(prng_descriptor[x].name))
+         continue;
+
+      /* sanity check on prng */
+      if ((err = prng_descriptor[x].test()) != CRYPT_OK) {
+         fprintf(stderr, "\n\nERROR: PRNG %s failed self-test %s\n", prng_descriptor[x].name, error_to_string(err));
+         exit(EXIT_FAILURE);
+      }
+
+      prng_descriptor[x].start(&tprng);
+      zeromem(buf, 256);
+      prng_descriptor[x].add_entropy(buf, 256, &tprng);
+      prng_descriptor[x].ready(&tprng);
+      t2 = -1;
+
+#define DO1 if (prng_descriptor[x].read(buf, 4096, &tprng) != 4096) { fprintf(stderr, "\n\nERROR READ != 4096\n\n"); exit(EXIT_FAILURE); }
+#define DO2 DO1 DO1
+      for (y = 0; y < 10000; y++) {
+         t_start();
+         t1 = t_read();
+         DO2;
+         t1 = (t_read() - t1)>>1;
+         if (t1 < t2) t2 = t1;
+      }
+      fprintf(stderr, "%20s: %5"PRI64"u, ", prng_descriptor[x].name, t2>>12);
+#undef DO2
+#undef DO1
+
+#define DO1 prng_descriptor[x].start(&tprng); prng_descriptor[x].add_entropy(buf, 32, &tprng); prng_descriptor[x].ready(&tprng); prng_descriptor[x].done(&tprng);
+#define DO2 DO1 DO1
+      for (y = 0; y < 10000; y++) {
+         t_start();
+         t1 = t_read();
+         DO2;
+         t1 = (t_read() - t1)>>1;
+         if (t1 < t2) t2 = t1;
+      }
+      fprintf(stderr, "%5"PRI64"u\n", t2);
+#undef DO2
+#undef DO1
+
+   }
+}
+
+#if defined(LTC_MDSA)
+/* time various DSA operations */
+static void time_dsa(void)
+{
+   dsa_key       key;
+   ulong64       t1, t2;
+   unsigned long x, y;
+   int           err;
+static const struct {
+   int group, modulus;
+} groups[] = {
+{ 20, 96  },
+{ 20, 128 },
+{ 24, 192 },
+{ 28, 256 },
+#ifndef TFM_DESC
+{ 32, 512 },
+#endif
+};
+
+   if (ltc_mp.name == NULL) return;
+
+   for (x = 0; x < LTC_ARRAY_SIZE(groups); x++) {
+       t2 = 0;
+       for (y = 0; y < 4; y++) {
+           t_start();
+           t1 = t_read();
+           if ((err = dsa_generate_pqg(&timing_prng, timing_prng_id, groups[x].group, groups[x].modulus, &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\ndsa_generate_pqg says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+           }
+           if ((err = dsa_generate_key(&timing_prng, timing_prng_id, &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\ndsa_make_key says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+           }
+           t1 = t_read() - t1;
+           t2 += t1;
+
+#ifdef LTC_PROFILE
+       t2 <<= 2;
+       break;
+#endif
+           if (y < 3) {
+              dsa_free(&key);
+           }
+       }
+       t2 >>= 2;
+       fprintf(stderr, "DSA-(%lu, %lu) make_key    took %15"PRI64"u cycles\n", (unsigned long)groups[x].group*8, (unsigned long)groups[x].modulus*8, t2);
+       dsa_free(&key);
+   }
+   fprintf(stderr, "\n\n");
+}
+#else
+static void time_dsa(void) { fprintf(stderr, "NO DSA\n"); }
+#endif
+
+
+#if defined(LTC_MRSA)
+/* time various RSA operations */
+static void time_rsa(void)
+{
+   rsa_key       key;
+   ulong64       t1, t2;
+   unsigned char buf[2][2048] = { 0 };
+   unsigned long x, y, z, zzz;
+   int           err, zz, stat;
+   ltc_rsa_op_parameters rsa_params = {
+      .u.crypt.lparam = (const unsigned char *)"testprog",
+      .u.crypt.lparamlen = 8,
+      .prng = &timing_prng,
+      .wprng = timing_prng_id,
+      .params.hash_idx = find_hash("sha1"),
+      .params.mgf1_hash_idx = find_hash("sha1"),
+      .params.saltlen = 8,
+   };
+
+   if (ltc_mp.name == NULL) return;
+
+   for (x = 2048; x <= 8192; x <<= 1) {
+       t2 = 0;
+       rsa_params.padding = LTC_PKCS_1_OAEP;
+       for (y = 0; y < 4; y++) {
+           t_start();
+           t1 = t_read();
+           if ((err = rsa_make_key(&timing_prng, timing_prng_id, x/8, 65537, &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\nrsa_make_key says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+           }
+           t1 = t_read() - t1;
+           t2 += t1;
+
+#ifdef LTC_PROFILE
+       t2 <<= 2;
+       break;
+#endif
+
+           if (y < 3) {
+              rsa_free(&key);
+           }
+       }
+       t2 >>= 2;
+       fprintf(stderr, "RSA-%lu make_key    took %15"PRI64"u cycles\n", x, t2);
+
+       t2 = 0;
+       for (y = 0; y < 16; y++) {
+           t_start();
+           t1 = t_read();
+           z = sizeof(buf[1]);
+           if ((err = rsa_encrypt_key_v2(buf[0], 32, buf[1], &z, &rsa_params, &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\nrsa_encrypt_key says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+           }
+           t1 = t_read() - t1;
+           t2 += t1;
+#ifdef LTC_PROFILE
+       t2 <<= 4;
+       break;
+#endif
+       }
+       t2 >>= 4;
+       fprintf(stderr, "RSA-%lu encrypt_key took %15"PRI64"u cycles\n", x, t2);
+
+       t2 = 0;
+       for (y = 0; y < 2048; y++) {
+           t_start();
+           t1 = t_read();
+           zzz = sizeof(buf[0]);
+           if ((err = rsa_decrypt_key_v2(buf[1], z, buf[0], &zzz, &rsa_params, &zz, &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\nrsa_decrypt_key says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+           }
+           t1 = t_read() - t1;
+           t2 += t1;
+#ifdef LTC_PROFILE
+       t2 <<= 11;
+       break;
+#endif
+       }
+       t2 >>= 11;
+       fprintf(stderr, "RSA-%lu decrypt_key took %15"PRI64"u cycles\n", x, t2);
+
+       t2 = 0;
+       rsa_params.padding = LTC_PKCS_1_PSS;
+       for (y = 0; y < 256; y++) {
+          t_start();
+          t1 = t_read();
+          z = sizeof(buf[1]);
+          if ((err = rsa_sign_hash_v2(buf[0], 20, buf[1], &z, &rsa_params, &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\nrsa_sign_hash says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+           }
+           t1 = t_read() - t1;
+           t2 += t1;
+#ifdef LTC_PROFILE
+       t2 <<= 8;
+       break;
+#endif
+        }
+        t2 >>= 8;
+        fprintf(stderr, "RSA-%lu sign_hash took   %15"PRI64"u cycles\n", x, t2);
+
+       t2 = 0;
+       for (y = 0; y < 2048; y++) {
+          t_start();
+          t1 = t_read();
+          if ((err = rsa_verify_hash_v2(buf[1], z, buf[0], 20, &rsa_params, &stat, &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\nrsa_verify_hash says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+          }
+          if (stat == 0) {
+             fprintf(stderr, "\n\nrsa_verify_hash for RSA-%lu failed to verify signature(%lu)\n", x, y);
+             exit(EXIT_FAILURE);
+          }
+          t1 = t_read() - t1;
+          t2 += t1;
+#ifdef LTC_PROFILE
+       t2 <<= 11;
+       break;
+#endif
+        }
+        t2 >>= 11;
+        fprintf(stderr, "RSA-%lu verify_hash took %15"PRI64"u cycles\n", x, t2);
+       fprintf(stderr, "\n\n");
+       rsa_free(&key);
+  }
+}
+#else
+static void time_rsa(void) { fprintf(stderr, "NO RSA\n"); }
+#endif
+
+#if defined(LTC_MDH)
+/* time various DH operations */
+static void time_dh(void)
+{
+   dh_key key;
+   ulong64 t1, t2;
+   unsigned long i, x, y;
+   int           err;
+   static unsigned long sizes[] = {768/8, 1024/8, 1536/8, 2048/8,
+#ifndef TFM_DESC
+                                   3072/8, 4096/8, 6144/8, 8192/8,
+#endif
+                                   100000
+   };
+
+   if (ltc_mp.name == NULL) return;
+
+   for (x = sizes[i=0]; x < 100000; x = sizes[++i]) {
+       t2 = 0;
+       for (y = 0; y < 16; y++) {
+           if((err = dh_set_pg_groupsize(x, &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\ndh_set_pg_groupsize says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+           }
+
+           t_start();
+           t1 = t_read();
+           if ((err = dh_generate_key(&timing_prng, timing_prng_id, &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\ndh_make_key says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+           }
+           t1 = t_read() - t1;
+           t2 += t1;
+
+           dh_free(&key);
+       }
+       t2 >>= 4;
+       fprintf(stderr, "DH-%4lu make_key    took %15"PRI64"u cycles\n", x*8, t2);
+  }
+}
+#else
+static void time_dh(void) { fprintf(stderr, "NO DH\n"); }
+#endif
+
+#if defined(LTC_MECC)
+/* time various ECC operations */
+static void time_ecc(void)
+{
+   ecc_key key;
+   ulong64 t1, t2;
+   unsigned char buf[2][256] = { 0 };
+   unsigned long i, w, x, y, z;
+   int           err, stat, hashidx;
+   const unsigned long sizes[] = {
+#ifdef LTC_ECC_SECP112R1
+112/8,
+#endif
+#ifdef LTC_ECC_SECP128R1
+128/8,
+#endif
+#ifdef LTC_ECC_SECP160R1
+160/8,
+#endif
+#ifdef LTC_ECC_SECP192R1
+192/8,
+#endif
+#ifdef LTC_ECC_SECP224R1
+224/8,
+#endif
+#ifdef LTC_ECC_SECP256R1
+256/8,
+#endif
+#ifdef LTC_ECC_SECP384R1
+384/8,
+#endif
+#ifdef LTC_ECC_SECP521R1
+521/8,
+#endif
+100000};
+   prng_state ecc_prng;
+   ltc_ecc_sig_opts sig_opts = {
+                                .type = LTC_ECCSIG_RFC7518,
+                                .prng = &ecc_prng,
+                                .wprng = timing_prng_id
+   };
+   const unsigned char prng_entropy[] = {
+                                          0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+                                          0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+                                          0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+                                          0x1f, 0x20, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                                          0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12,
+                                          0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+                                          0x1d, 0x1e, 0x1f, 0x20
+   };
+   if ((err = prng_descriptor[timing_prng_id].pimport(prng_entropy, sizeof(prng_entropy), &ecc_prng)) != CRYPT_OK) {
+      fprintf(stderr, "\n\nprng.import() says %s!\n", error_to_string(err));
+      exit(EXIT_FAILURE);
+   }
+   if ((err = prng_descriptor[timing_prng_id].ready(&ecc_prng)) != CRYPT_OK) {
+      fprintf(stderr, "\n\nprng.ready() says %s!\n", error_to_string(err));
+      exit(EXIT_FAILURE);
+   }
+
+   if (ltc_mp.name == NULL) return;
+   hashidx = find_hash("sha1");
+
+   for (x = sizes[i=0]; x < 100000; x = sizes[++i]) {
+       t2 = 0;
+       for (y = 0; y < 256; y++) {
+           t_start();
+           t1 = t_read();
+           if ((err = ecc_make_key(sig_opts.prng, sig_opts.wprng, x, &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\necc_make_key says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+           }
+           t1 = t_read() - t1;
+           t2 += t1;
+
+#ifdef LTC_PROFILE
+           t2 <<= 8;
+           break;
+#endif
+
+           if (y < 255) {
+              ecc_free(&key);
+           }
+       }
+       t2 >>= 8;
+       fprintf(stderr, "ECC-%lu make_key    took %15"PRI64"u cycles\n", x*8, t2);
+
+       t2 = 0;
+       for (y = 0; y < 256; y++) {
+           t_start();
+           t1 = t_read();
+           z = sizeof(buf[1]);
+           if ((err = ecc_encrypt_key(buf[0], 20, buf[1], &z, sig_opts.prng, sig_opts.wprng, hashidx,
+                                      &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\necc_encrypt_key says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+           }
+           t1 = t_read() - t1;
+           t2 += t1;
+#ifdef LTC_PROFILE
+           t2 <<= 8;
+           break;
+#endif
+       }
+       t2 >>= 8;
+       fprintf(stderr, "ECC-%lu encrypt_key took %15"PRI64"u cycles\n", x*8, t2);
+
+
+       t2 = 0;
+       for (y = 0; y < 256; y++) {
+           t_start();
+           t1 = t_read();
+           w = 20;
+           if ((err = ecc_decrypt_key(buf[1], z, buf[0], &w, &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\necc_decrypt_key says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+           }
+           t1 = t_read() - t1;
+           t2 += t1;
+#ifdef LTC_PROFILE
+           t2 <<= 8;
+           break;
+#endif
+       }
+       t2 >>= 8;
+       fprintf(stderr, "ECC-%lu decrypt_key took %15"PRI64"u cycles\n", x*8, t2);
+
+       t2 = 0;
+       for (y = 0; y < 256; y++) {
+          t_start();
+          t1 = t_read();
+          z = sizeof(buf[1]);
+          if ((err = ecc_sign_hash_v2(buf[0], 20, buf[1], &z, &sig_opts, &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\necc_sign_hash says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+           }
+           t1 = t_read() - t1;
+           t2 += t1;
+#ifdef LTC_PROFILE
+           t2 <<= 8;
+           break;
+#endif
+        }
+        t2 >>= 8;
+        fprintf(stderr, "ECC-%lu sign_hash took   %15"PRI64"u cycles\n", x*8, t2);
+
+       t2 = 0;
+       for (y = 0; y < 256; y++) {
+          t_start();
+          t1 = t_read();
+          if ((err = ecc_verify_hash_v2(buf[1], z, buf[0], 20, &sig_opts, &stat, &key)) != CRYPT_OK) {
+              fprintf(stderr, "\n\necc_verify_hash says %s, wait...no it should say %s...damn you!\n", error_to_string(err), error_to_string(CRYPT_OK));
+              exit(EXIT_FAILURE);
+          }
+          if (stat == 0) {
+             fprintf(stderr, "\n\necc_verify_hash for ECC-%lu failed to verify signature(%lu)\n", x*8, y);
+             exit(EXIT_FAILURE);
+          }
+          t1 = t_read() - t1;
+          t2 += t1;
+#ifdef LTC_PROFILE
+          t2 <<= 8;
+          break;
+#endif
+        }
+        t2 >>= 8;
+        fprintf(stderr, "ECC-%lu verify_hash took %15"PRI64"u cycles\n", x*8, t2);
+
+       fprintf(stderr, "\n\n");
+       ecc_free(&key);
+  }
+}
+#else
+static void time_ecc(void) { fprintf(stderr, "NO ECC\n"); }
+#endif
+
+typedef struct mac_ctx {
+   unsigned char *buf, key[32], tag[16];
+   unsigned long size;
+   int cipher_idx, hash_idx;
+} mac_ctx;
+
+#ifdef LTC_OMAC
+static void time_omac(mac_ctx *ctx)
+{
+   ulong64 t1, t2;
+   unsigned long x, z;
+   int err;
+
+   t2 = -1;
+   for (x = 0; x < 10000; x++) {
+        t_start();
+        t1 = t_read();
+        z = 16;
+        if ((err = omac_memory(ctx->cipher_idx, ctx->key, 16, ctx->buf, ctx->size, ctx->tag, &z)) != CRYPT_OK) {
+           fprintf(stderr, "\n\nomac-%s error... %s\n", cipher_descriptor[ctx->cipher_idx].name, error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        t1 = t_read() - t1;
+        if (t1 < t2) t2 = t1;
+   }
+   fprintf(stderr, "OMAC-%s\t\t%9"PRI64"u\n", cipher_descriptor[ctx->cipher_idx].name, t2/(ulong64)(ctx->size));
+}
+#endif
+
+#ifdef LTC_XCBC
+static void time_xcbc(mac_ctx *ctx)
+{
+   ulong64 t1, t2;
+   unsigned long x, z;
+   int err;
+
+   t2 = -1;
+   for (x = 0; x < 10000; x++) {
+        t_start();
+        t1 = t_read();
+        z = 16;
+        if ((err = xcbc_memory(ctx->cipher_idx, ctx->key, 16, ctx->buf, ctx->size, ctx->tag, &z)) != CRYPT_OK) {
+           fprintf(stderr, "\n\nxcbc-%s error... %s\n", cipher_descriptor[ctx->cipher_idx].name, error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        t1 = t_read() - t1;
+        if (t1 < t2) t2 = t1;
+   }
+   fprintf(stderr, "XCBC-%s\t\t%9"PRI64"u\n", cipher_descriptor[ctx->cipher_idx].name, t2/(ulong64)(ctx->size));
+}
+#endif
+
+#ifdef LTC_F9_MODE
+static void time_f9(mac_ctx *ctx)
+{
+   ulong64 t1, t2;
+   unsigned long x, z;
+   int err;
+
+   t2 = -1;
+   for (x = 0; x < 10000; x++) {
+        t_start();
+        t1 = t_read();
+        z = 16;
+        if ((err = f9_memory(ctx->cipher_idx, ctx->key, 16, ctx->buf, ctx->size, ctx->tag, &z)) != CRYPT_OK) {
+           fprintf(stderr, "\n\nF9-%s error... %s\n", cipher_descriptor[ctx->cipher_idx].name, error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        t1 = t_read() - t1;
+        if (t1 < t2) t2 = t1;
+   }
+   fprintf(stderr, "F9-%s\t\t\t%9"PRI64"u\n", cipher_descriptor[ctx->cipher_idx].name, t2/(ulong64)(ctx->size));
+}
+#endif
+
+#ifdef LTC_PMAC
+static void time_pmac(mac_ctx *ctx)
+{
+   ulong64 t1, t2;
+   unsigned long x, z;
+   int err;
+
+   t2 = -1;
+   for (x = 0; x < 10000; x++) {
+        t_start();
+        t1 = t_read();
+        z = 16;
+        if ((err = pmac_memory(ctx->cipher_idx, ctx->key, 16, ctx->buf, ctx->size, ctx->tag, &z)) != CRYPT_OK) {
+           fprintf(stderr, "\n\npmac-%s error... %s\n", cipher_descriptor[ctx->cipher_idx].name, error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        t1 = t_read() - t1;
+        if (t1 < t2) t2 = t1;
+   }
+   fprintf(stderr, "PMAC-%s\t\t%9"PRI64"u\n", cipher_descriptor[ctx->cipher_idx].name, t2/(ulong64)(ctx->size));
+}
+#endif
+
+#ifdef LTC_PELICAN
+static void time_pelican(mac_ctx *ctx)
+{
+   ulong64 t1, t2;
+   unsigned long x;
+   int err;
+
+   t2 = -1;
+   for (x = 0; x < 10000; x++) {
+        t_start();
+        t1 = t_read();
+        if ((err = pelican_memory(ctx->key, 16, ctx->buf, ctx->size, ctx->tag)) != CRYPT_OK) {
+           fprintf(stderr, "\n\npelican error... %s\n", error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        t1 = t_read() - t1;
+        if (t1 < t2) t2 = t1;
+   }
+   fprintf(stderr, "PELICAN \t\t%9"PRI64"u\n", t2/(ulong64)(ctx->size));
+}
+#endif
+
+#ifdef LTC_HMAC
+static void time_hmac(mac_ctx *ctx)
+{
+   ulong64 t1, t2;
+   unsigned long x, z;
+   int err;
+
+   t2 = -1;
+   for (x = 0; x < 10000; x++) {
+        t_start();
+        t1 = t_read();
+        z = 16;
+        if ((err = hmac_memory(ctx->hash_idx, ctx->key, 16, ctx->buf, ctx->size, ctx->tag, &z)) != CRYPT_OK) {
+           fprintf(stderr, "\n\nhmac-%s error... %s\n", hash_descriptor[ctx->hash_idx].name, error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        t1 = t_read() - t1;
+        if (t1 < t2) t2 = t1;
+   }
+   fprintf(stderr, "HMAC-%s\t\t%9"PRI64"u\n", hash_descriptor[ctx->hash_idx].name, t2/(ulong64)(ctx->size));
+}
+#endif
+
+static void time_macs_(unsigned long MAC_SIZE)
+{
+#if defined(LTC_OMAC) || defined(LTC_XCBC) || defined(LTC_F9_MODE) || defined(LTC_PMAC) || defined(LTC_PELICAN) || defined(LTC_HMAC)
+   mac_ctx ctx;
+   struct {
+      const char *name;
+      void (*time_fun)(mac_ctx*);
+   } time_funs[] = {
+#define TIME_FUN(n) { #n, time_ ## n }
+#ifdef LTC_OMAC
+                  TIME_FUN(omac),
+#endif
+#ifdef LTC_XCBC
+                  TIME_FUN(xcbc),
+#endif
+#ifdef LTC_F9_MODE
+                  TIME_FUN(f9),
+#endif
+#ifdef LTC_PMAC
+                  TIME_FUN(pmac),
+#endif
+#ifdef LTC_PELICAN
+                  TIME_FUN(pelican),
+#endif
+#ifdef LTC_HMAC
+                  TIME_FUN(hmac),
+#endif
+#undef TIME_FUN
+   };
+   unsigned long n;
+
+   fprintf(stderr, "\nMAC Timings (cycles/byte on %luKB blocks):\n", MAC_SIZE);
+
+   ctx.size = MAC_SIZE*1024;
+   ctx.buf = XMALLOC(ctx.size);
+   if (ctx.buf == NULL) {
+      fprintf(stderr, "\n\nout of heap yo\n\n");
+      exit(EXIT_FAILURE);
+   }
+
+   ctx.cipher_idx = find_cipher("aes");
+   ctx.hash_idx   = find_hash("sha1");
+
+   if (ctx.cipher_idx == -1 || ctx.hash_idx == -1) {
+      fprintf(stderr, "Warning the MAC tests requires AES and SHA1 to operate... so sorry\n");
+      exit(EXIT_FAILURE);
+   }
+
+   prng_descriptor[timing_prng_id].read(ctx.buf, ctx.size, &timing_prng);
+   prng_descriptor[timing_prng_id].read(ctx.key, sizeof(ctx.key), &timing_prng);
+
+   for (n = 0; n < LTC_ARRAY_SIZE(time_funs); ++n) {
+      if (!should_skip(time_funs[n].name))
+         time_funs[n].time_fun(&ctx);
+   }
+
+   XFREE(ctx.buf);
+#else
+   LTC_UNUSED_PARAM(MAC_SIZE);
+   fprintf(stderr, "NO MACs\n");
+#endif
+}
+
+static void time_macs(void)
+{
+   time_macs_(1);
+   time_macs_(4);
+   time_macs_(32);
+}
+
+typedef struct eac_ctx {
+   unsigned char *buf, IV[16], key[32], tag[16];
+   unsigned long size;
+   int cipher_idx;
+} eac_ctx;
+
+#ifdef LTC_EAX_MODE
+static void time_eax(eac_ctx *ctx)
+{
+   ulong64 t1, t2;
+   unsigned long x, z;
+   int err;
+
+   t2 = -1;
+   for (x = 0; x < 10000; x++) {
+        t_start();
+        t1 = t_read();
+        z = 16;
+        if ((err = eax_encrypt_authenticate_memory(ctx->cipher_idx, ctx->key, 16, ctx->IV, 16, NULL, 0, ctx->buf, ctx->size, ctx->buf, ctx->tag, &z)) != CRYPT_OK) {
+           fprintf(stderr, "\nEAX error... %s\n", error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        t1 = t_read() - t1;
+        if (t1 < t2) t2 = t1;
+   }
+   fprintf(stderr, "EAX \t\t\t%9"PRI64"u\n", t2/(ulong64)(ctx->size));
+}
+#endif
+
+#if defined(LTC_OCB3_MODE)
+static void time_ocb3(eac_ctx *ctx)
+{
+   ulong64 t1, t2;
+   unsigned long x, z;
+   int err;
+
+   t2 = -1;
+   for (x = 0; x < 10000; x++) {
+        t_start();
+        t1 = t_read();
+        z = 16;
+        if ((err = ocb3_encrypt_authenticate_memory(ctx->cipher_idx, ctx->key, 16, ctx->IV, 15, (unsigned char*)"", 0, ctx->buf, ctx->size, ctx->buf, ctx->tag, &z)) != CRYPT_OK) {
+           fprintf(stderr, "\nOCB3 error... %s\n", error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        t1 = t_read() - t1;
+        if (t1 < t2) t2 = t1;
+   }
+   fprintf(stderr, "OCB3 \t\t\t%9"PRI64"u\n", t2/(ulong64)(ctx->size));
+}
+#endif
+
+#if defined(LTC_CCM_MODE)
+static void time_ccm(eac_ctx *ctx)
+{
+   ulong64 t1, t2;
+   unsigned long x, z;
+   int err;
+   symmetric_ECB skey;
+
+   t2 = -1;
+   for (x = 0; x < 10000; x++) {
+        t_start();
+        t1 = t_read();
+        z = 16;
+        if ((err = ccm_memory(ctx->cipher_idx, ctx->key, 16, NULL, ctx->IV, 13, NULL, 0, ctx->buf, ctx->size, ctx->buf, ctx->tag, &z, CCM_ENCRYPT)) != CRYPT_OK) {
+           fprintf(stderr, "\nCCM error... %s\n", error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        t1 = t_read() - t1;
+        if (t1 < t2) t2 = t1;
+   }
+   fprintf(stderr, "CCM (no-precomp) \t%9"PRI64"u\n", t2/(ulong64)(ctx->size));
+
+   ecb_start(ctx->cipher_idx, ctx->key, 16, 0, &skey);
+   t2 = -1;
+   for (x = 0; x < 10000; x++) {
+        t_start();
+        t1 = t_read();
+        z = 16;
+        if ((err = ccm_memory(ctx->cipher_idx, ctx->key, 16, &skey, ctx->IV, 13, NULL, 0, ctx->buf, ctx->size, ctx->buf, ctx->tag, &z, CCM_ENCRYPT)) != CRYPT_OK) {
+           fprintf(stderr, "\nCCM error... %s\n", error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        t1 = t_read() - t1;
+        if (t1 < t2) t2 = t1;
+   }
+   fprintf(stderr, "CCM (precomp) \t\t%9"PRI64"u\n", t2/(ulong64)(ctx->size));
+   ecb_done(&skey);
+}
+#endif
+
+#if defined (LTC_GCM_MODE)
+static void time_gcm(eac_ctx *ctx)
+{
+   ulong64 t1, t2;
+   unsigned long x, z;
+   int err;
+   gcm_state gcm
+#ifdef LTC_GCM_TABLES_SSE2
+__attribute__ ((aligned (16)))
+#endif
+;
+   t2 = -1;
+   for (x = 0; x < 100; x++) {
+        t_start();
+        t1 = t_read();
+        z = 16;
+        if ((err = gcm_memory(ctx->cipher_idx, ctx->key, 16, ctx->IV, 16, NULL, 0, ctx->buf, ctx->size, ctx->buf, ctx->tag, &z, GCM_ENCRYPT)) != CRYPT_OK) {
+           fprintf(stderr, "\nGCM error... %s\n", error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        t1 = t_read() - t1;
+        if (t1 < t2) t2 = t1;
+   }
+   fprintf(stderr, "GCM (no-precomp)\t%9"PRI64"u\n", t2/(ulong64)(ctx->size));
+
+   if ((err = gcm_init(&gcm, ctx->cipher_idx, ctx->key, 16)) != CRYPT_OK) { fprintf(stderr, "gcm_init: %s\n", error_to_string(err)); exit(EXIT_FAILURE); }
+   t2 = -1;
+   for (x = 0; x < 10000; x++) {
+        t_start();
+        t1 = t_read();
+        z = 16;
+        if ((err = gcm_reset(&gcm)) != CRYPT_OK) {
+            fprintf(stderr, "\nGCM error[%d]... %s\n", __LINE__, error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        if ((err = gcm_add_iv(&gcm, ctx->IV, 16)) != CRYPT_OK) {
+            fprintf(stderr, "\nGCM error[%d]... %s\n", __LINE__, error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        if ((err = gcm_add_aad(&gcm, NULL, 0)) != CRYPT_OK) {
+            fprintf(stderr, "\nGCM error[%d]... %s\n", __LINE__, error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        if ((err = gcm_process(&gcm, ctx->buf, ctx->size, ctx->buf, GCM_ENCRYPT)) != CRYPT_OK) {
+            fprintf(stderr, "\nGCM error[%d]... %s\n", __LINE__, error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+
+        if ((err = gcm_done(&gcm, ctx->tag, &z)) != CRYPT_OK) {
+            fprintf(stderr, "\nGCM error[%d]... %s\n", __LINE__, error_to_string(err));
+           exit(EXIT_FAILURE);
+        }
+        t1 = t_read() - t1;
+        if (t1 < t2) t2 = t1;
+   }
+   fprintf(stderr, "GCM (precomp)\t\t%9"PRI64"u\n", t2/(ulong64)(ctx->size));
+}
+#endif
+
+#if defined(LTC_SIV_MODE)
+static void time_siv(eac_ctx *ctx)
+{
+   ulong64 t1, t2;
+   unsigned long x, z;
+   int err;
+   unsigned char *aad[4];
+   unsigned long buflen;
+
+   for(z = 0; z < 4; z++) {
+      aad[z] = ctx->IV + z * 4;
+   }
+   for(z = 0; z < 4; z++) {
+      t2 = -1;
+      for (x = 0; x < 10000; x++) {
+           buflen = ctx->size;
+           t_start();
+           t1 = t_read();
+           if ((err = siv_memory(ctx->cipher_idx, LTC_ENCRYPT,
+                                 ctx->key, 32,
+                                 ctx->buf, ctx->size - 16,
+                                 ctx->buf, &buflen,
+                                 4 - z,
+                                 aad[0], 16,
+                                 aad[1], 12,
+                                 aad[2], 8,
+                                 aad[3], 4,
+                                 NULL)) != CRYPT_OK) {
+              fprintf(stderr, "\nSIV error... %s\n", error_to_string(err));
+              exit(EXIT_FAILURE);
+           }
+           t1 = t_read() - t1;
+           if (t1 < t2) t2 = t1;
+      }
+      aad[3-z] = NULL;
+      fprintf(stderr, "SIV (%lu x AAD)\t\t%9"PRI64"u\n", 4-z, t2/(ulong64)(ctx->size));
+   }
+}
+#endif
+
+static void time_eacs_(unsigned long MAC_SIZE)
+{
+#if defined(LTC_EAX_MODE) || defined(LTC_OCB3_MODE) || \
+   defined(LTC_CCM_MODE) || defined(LTC_GCM_MODE) || defined(LTC_SIV_MODE)
+   eac_ctx ctx;
+   struct {
+      const char *name;
+      void (*time_fun)(eac_ctx*);
+   } time_funs[] = {
+#define TIME_FUN(n) { #n, time_ ## n }
+#ifdef LTC_EAX_MODE
+                    TIME_FUN(eax),
+#endif
+#ifdef LTC_OCB3_MODE
+                    TIME_FUN(ocb3),
+#endif
+#ifdef LTC_CCM_MODE
+                    TIME_FUN(ccm),
+#endif
+#ifdef LTC_GCM_MODE
+                    TIME_FUN(gcm),
+#endif
+#ifdef LTC_SIV_MODE
+                    TIME_FUN(siv),
+#endif
+#undef TIME_FUN
+   };
+   unsigned long n;
+
+   fprintf(stderr, "\nENC+MAC Timings (zero byte AAD, 16 byte IV, cycles/byte on %luKB blocks):\n", MAC_SIZE);
+
+   ctx.size = MAC_SIZE*1024;
+   ctx.buf = XMALLOC(ctx.size);
+   if (ctx.buf == NULL) {
+      fprintf(stderr, "\n\nout of heap yo\n\n");
+      exit(EXIT_FAILURE);
+   }
+
+   ctx.cipher_idx = find_cipher("aes");
+
+   prng_descriptor[timing_prng_id].read(ctx.buf, ctx.size, &timing_prng);
+   prng_descriptor[timing_prng_id].read(ctx.key, sizeof(ctx.key), &timing_prng);
+   prng_descriptor[timing_prng_id].read(ctx.IV, sizeof(ctx.IV), &timing_prng);
+
+   for (n = 0; n < LTC_ARRAY_SIZE(time_funs); ++n) {
+      if (!should_skip(time_funs[n].name))
+         time_funs[n].time_fun(&ctx);
+   }
+
+   XFREE(ctx.buf);
+#else
+   LTC_UNUSED_PARAM(MAC_SIZE);
+   fprintf(stderr, "NO ENCMACs\n");
+#endif
+
+}
+
+static void time_eacs(void)
+{
+   time_eacs_(1);
+   time_eacs_(4);
+   time_eacs_(32);
+}
+
+static void LTC_NORETURN die(int status)
+{
+   FILE* o = status == EXIT_SUCCESS ? stdout : stderr;
+   fprintf(o,
+         "Usage: timing [<-h|-l|alg>] [mpi] [filter]\n\n"
+         "Run timing tests of all built-in algorithms, or only the one given in <alg>.\n\n"
+         "\talg\tThe algorithms to test. Use the '-l' option to check for valid values.\n"
+         "\tmpi\tThe MPI provider to use.\n"
+         "\tfilter\tFilter within the algorithm class (currently only for 'cipher's, 'hash'es, and 'prng's).\n"
+         "\t-l\tList all built-in algorithms that can be timed.\n"
+         "\t-h\tThe help you're looking at.\n\n"
+         "Examples:\n"
+         "\ttiming hash sha\t\tWill run the timing demo for all hashes containing 'sha' in their name\n"
+   );
+   exit(status);
+}
+
+#define LTC_TEST_FN(f)  { time_ ## f, #f }
+int main(int argc, char **argv)
+{
+int err;
+
+const struct
+{
+   void (*fn)(void);
+   const char* name;
+} test_functions[] = {
+   LTC_TEST_FN(keysched),
+   LTC_TEST_FN(cipher_ecb),
+   LTC_TEST_FN(cipher_cbc),
+   LTC_TEST_FN(cipher_ctr),
+   LTC_TEST_FN(cipher_lrw),
+   LTC_TEST_FN(hash),
+   LTC_TEST_FN(macs),
+   LTC_TEST_FN(eacs),
+   LTC_TEST_FN(prng),
+   LTC_TEST_FN(mult),
+   LTC_TEST_FN(sqr),
+   LTC_TEST_FN(rsa),
+   LTC_TEST_FN(dsa),
+   LTC_TEST_FN(ecc),
+   LTC_TEST_FN(dh),
+};
+char *single_test = NULL;
+unsigned int i;
+const char* mpi_provider = NULL;
+
+if (argc > 1) {
+   if (strstr(argv[1], "-h")) {
+      die(EXIT_SUCCESS);
+   } else if (strstr(argv[1], "-l")) {
+      for (i = 0; i < LTC_ARRAY_SIZE(test_functions); ++i) {
+         printf("%s\n", test_functions[i].name);
+      }
+      exit(0);
+   }
+}
+
+init_timer();
+register_all_ciphers();
+register_all_hashes();
+register_all_prngs();
+
+#ifdef USE_LTM
+   mpi_provider = "ltm";
+#elif defined(USE_TFM)
+   mpi_provider = "tfm";
+#elif defined(USE_GMP)
+   mpi_provider = "gmp";
+#elif defined(EXT_MATH_LIB)
+   mpi_provider = "ext";
+#endif
+
+   if (argc > 2) {
+      mpi_provider = argv[2];
+   }
+
+   if (crypt_mp_init(mpi_provider) != CRYPT_OK) {
+      fprintf(stderr, "Init of MPI provider \"%s\" failed\n", mpi_provider ? mpi_provider : "(null)");
+      filter_arg = mpi_provider;
+   } else if (argc > 3){
+      filter_arg = argv[3];
+   }
+if (find_prng("sober128") != -1)
+   timing_prng_name = "sober128";
+else
+   timing_prng_name = "yarrow";
+timing_prng_id = find_prng(timing_prng_name);
+if ((err = rng_make_prng(128, timing_prng_id, &timing_prng, NULL)) != CRYPT_OK) {
+   fprintf(stderr, "rng_make_prng failed: %s\n", error_to_string(err));
+   exit(EXIT_FAILURE);
+}
+
+/* single test name from commandline */
+if (argc > 1) single_test = argv[1];
+
+for (i = 0; i < LTC_ARRAY_SIZE(test_functions); ++i) {
+   if (single_test && strstr(test_functions[i].name, single_test) == NULL) {
+     continue;
+   }
+   test_functions[i].fn();
+}
+
+return EXIT_SUCCESS;
+
+}

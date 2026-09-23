@@ -1,0 +1,89 @@
+/* LibTomCrypt, modular cryptographic library -- Tom St Denis */
+/* SPDX-License-Identifier: Unlicense */
+
+#include "tomcrypt_private.h"
+
+/**
+  @file ecc_shared_secret.c
+  ECC Crypto, Tom St Denis
+*/
+
+#ifdef LTC_MECC
+
+/**
+  Create an ECC shared secret between two keys
+  @param private_key      The private ECC key
+  @param public_key       The public key
+  @param out              [out] Destination of the shared secret (Conforms to EC-DH from ANSI X9.63)
+  @param outlen           [in/out] The max size and resulting size of the shared secret
+  @return CRYPT_OK if successful
+*/
+int ecc_shared_secret(const ecc_key *private_key, const ecc_key *public_key,
+                      unsigned char *out, unsigned long *outlen)
+{
+   unsigned long  x;
+   ecc_point     *result;
+   void          *prime, *a, *mp = NULL;
+   int            err, inf;
+
+   LTC_ARGCHK(private_key != NULL);
+   LTC_ARGCHK(public_key  != NULL);
+   LTC_ARGCHK(out         != NULL);
+   LTC_ARGCHK(outlen      != NULL);
+
+   /* type valid? */
+   if (private_key->type != PK_PRIVATE) {
+      return CRYPT_PK_NOT_PRIVATE;
+   }
+
+   /* Domain-parameter check: both keys must be on the same curve. Otherwise the scalar mul
+      below would silently use the private key's prime/A against a public point that lives
+      in a different group (scenarion from Wycheproof ecdh_*WrongCurve).
+   */
+   if (ltc_mp_cmp(private_key->dp.prime,  public_key->dp.prime)  != LTC_MP_EQ ||
+       ltc_mp_cmp(private_key->dp.order,  public_key->dp.order)  != LTC_MP_EQ ||
+       ltc_mp_cmp(private_key->dp.A,      public_key->dp.A)      != LTC_MP_EQ ||
+       ltc_mp_cmp(private_key->dp.B,      public_key->dp.B)      != LTC_MP_EQ ||
+       ltc_mp_cmp(private_key->dp.base.x, public_key->dp.base.x) != LTC_MP_EQ ||
+       ltc_mp_cmp(private_key->dp.base.y, public_key->dp.base.y) != LTC_MP_EQ ||
+       private_key->dp.cofactor != public_key->dp.cofactor) {
+      return CRYPT_PK_TYPE_MISMATCH;
+   }
+
+   /* make new point */
+   result = ltc_ecc_new_point();
+   if (result == NULL) {
+      return CRYPT_MEM;
+   }
+
+   prime = private_key->dp.prime;
+   a     = private_key->dp.A;
+
+   if ((err = ltc_mp.ecc_ptmul(private_key->k, &public_key->pubkey, result, a, prime, 0)) != CRYPT_OK)   { goto done; }
+
+   /* reject small-subgroup / invalid-curve attacks: k*pubkey must not be O */
+   if ((err = ltc_ecc_is_point_at_infinity(result, prime, &inf)) != CRYPT_OK)                            { goto done; }
+   if (inf) { err = CRYPT_ERROR; goto done; }
+
+   /* map=0 above kept z meaningful for the infinity check; now finish the affine map */
+   if ((err = ltc_mp_montgomery_setup(prime, &mp)) != CRYPT_OK)                                          { goto done; }
+   if ((err = ltc_mp.ecc_map(result, prime, mp)) != CRYPT_OK)                                            { goto done; }
+
+   x = (unsigned long)ltc_mp_unsigned_bin_size(prime);
+   if (*outlen < x) {
+      *outlen = x;
+      err = CRYPT_BUFFER_OVERFLOW;
+      goto done;
+   }
+   zeromem(out, x);
+   if ((err = ltc_mp_to_unsigned_bin(result->x, out + (x - ltc_mp_unsigned_bin_size(result->x))))   != CRYPT_OK) { goto done; }
+
+   err     = CRYPT_OK;
+   *outlen = x;
+done:
+   if (mp != NULL) ltc_mp_montgomery_free(mp);
+   ltc_ecc_del_point(result);
+   return err;
+}
+
+#endif
