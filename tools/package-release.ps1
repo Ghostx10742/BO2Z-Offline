@@ -48,13 +48,18 @@ foreach ($name in $expected.Keys) { Copy-Item -LiteralPath (Join-Path $publisher
 foreach ($name in @('README.md','LICENSE','NOTICE','THIRD-PARTY-NOTICES.md')) {
     Copy-Item -LiteralPath (Join-Path $project $name) -Destination $staging
 }
+$assetRoot = Join-Path $staging 'assets'
+New-Item -ItemType Directory -Path $assetRoot | Out-Null
+foreach ($name in @('FullCoverBO2-Offline.png','BO2Z-OfflineLauncher.png')) {
+    Copy-Item -LiteralPath (Join-Path (Join-Path $project 'assets') $name) -Destination $assetRoot
+}
 
 $files = @(Get-ChildItem -LiteralPath $staging -Recurse -File | ForEach-Object {
     @{ path = $_.FullName.Substring($staging.Length + 1).Replace('\','/');
        sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash;
        bytes = $_.Length }
 })
-if ($files.Count -ne 15) { throw "Unexpected release file count: $($files.Count)" }
+if ($files.Count -ne 17) { throw "Unexpected release file count: $($files.Count)" }
 $manifest = @{
     name = 'BO2Z-Offline'; version = $version;
     backend = 'fresh 1.0.0 source build';

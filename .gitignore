@@ -4,8 +4,8 @@
 /dist/
 /packages/
 /release/
+/downloads/
 *.zip
-!/downloads/BO2Z-Offline-1.0.0.zip
 *.dll
 *.exe
 *.pdb
